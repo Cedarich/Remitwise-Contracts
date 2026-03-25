@@ -547,7 +547,7 @@ impl BillPayments {
         };
 
         let bill_owner = bill.owner.clone();
-        let bill_external_ref = bill.external_ref.clone();
+        let _bill_external_ref = bill.external_ref.clone();
         bills.set(next_id, bill);
         env.storage()
             .instance()
@@ -624,7 +624,7 @@ impl BillPayments {
                 .set(&symbol_short!("NEXT_ID"), &next_id);
         }
 
-        let bill_external_ref = bill.external_ref.clone();
+        let _bill_external_ref = bill.external_ref.clone();
         let paid_amount = bill.amount;
         let was_recurring = bill.recurring;
         bills.set(bill_id, bill);
