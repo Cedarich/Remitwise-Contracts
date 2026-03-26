@@ -2031,6 +2031,516 @@ fn test_import_snapshot_min_supported_version_accepted() {
     assert!(ok, "snapshot at MIN_SUPPORTED_SCHEMA_VERSION must be accepted");
 }
 
+// ============================================================================
+// Extended snapshot import compatibility tests
+//
+// Covers:
+//  - Empty snapshot (zero goals) import
+//  - Malformed payload: tampered next_id causes checksum mismatch
+//  - Malformed payload: zeroed checksum on non-empty snapshot
+//  - Malformed payload: schema_version = u32::MAX rejected
+//  - Nonce replay: reusing a consumed nonce must panic
+//  - Nonce wrong value: supplying an incorrect nonce must panic
+//  - Ownership remap: snapshot goals owned by a different address are preserved
+//  - Multi-owner snapshot: all goal owners survive import unchanged
+//  - Import overwrites existing state: prior goals are replaced
+//  - Audit log: import appends a success entry to the audit log
+//  - Export event: export_snapshot emits the snap_exp event
+//  - Sequential imports: nonce increments correctly across multiple imports
+// ============================================================================
+
+/// Importing an empty snapshot (zero goals) must succeed and clear existing goals.
+///
+/// # Security note
+/// An empty import is a valid migration step (e.g. contract reset). The
+/// checksum for an empty payload must still be validated to prevent spoofing.
+#[test]
+fn test_import_empty_snapshot_succeeds_and_clears_goals() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+
+    client.init();
+    client.create_goal(&owner, &String::from_str(&env, "Old Goal"), &5000, &2000000000);
+
+    // Build an empty snapshot manually with a valid checksum.
+    // checksum = (version + next_id) * 31 = (1 + 0) * 31 = 31
+    let empty_snapshot = GoalsExportSnapshot {
+        schema_version: 1,
+        checksum: 31,
+        next_id: 0,
+        goals: Vec::new(&env),
+    };
+
+    let ok = client.import_snapshot(&owner, &0, &empty_snapshot);
+    assert!(ok, "empty snapshot import must succeed");
+
+    // After import, the old goal must no longer exist.
+    assert!(
+        client.get_goal(&1).is_none(),
+        "old goal must be cleared after empty snapshot import"
+    );
+}
+
+/// Malformed payload: tampering with `next_id` while keeping the original
+/// checksum must be rejected with ChecksumMismatch.
+///
+/// # Security note
+/// `next_id` is part of the checksum input. Any mutation of it without
+/// recomputing the checksum must be detected.
+#[test]
+fn test_import_snapshot_tampered_next_id_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+
+    client.init();
+    client.create_goal(&owner, &String::from_str(&env, "Goal"), &3000, &2000000000);
+
+    let mut snapshot = client.export_snapshot(&owner);
+    // Mutate next_id without updating checksum — payload is now malformed.
+    snapshot.next_id = snapshot.next_id.wrapping_add(99);
+
+    let result = client.try_import_snapshot(&owner, &0, &snapshot);
+    assert_eq!(
+        result,
+        Err(Ok(SavingsGoalError::ChecksumMismatch)),
+        "tampered next_id must be detected via checksum"
+    );
+}
+
+/// Malformed payload: a zeroed checksum on a non-empty snapshot must be
+/// rejected with ChecksumMismatch.
+///
+/// # Security note
+/// Checksum = 0 is only valid for a specific (version, next_id, goals)
+/// combination. For any non-trivial snapshot it must be rejected.
+#[test]
+fn test_import_snapshot_zero_checksum_on_nonempty_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+
+    client.init();
+    client.create_goal(&owner, &String::from_str(&env, "Goal"), &4000, &2000000000);
+
+    let mut snapshot = client.export_snapshot(&owner);
+    snapshot.checksum = 0;
+
+    let result = client.try_import_snapshot(&owner, &0, &snapshot);
+    assert_eq!(
+        result,
+        Err(Ok(SavingsGoalError::ChecksumMismatch)),
+        "zero checksum on non-empty snapshot must be rejected"
+    );
+}
+
+/// Malformed payload: schema_version = u32::MAX must be rejected as
+/// UnsupportedVersion (far-future version guard).
+#[test]
+fn test_import_snapshot_max_u32_schema_version_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+
+    client.init();
+    client.create_goal(&owner, &String::from_str(&env, "Goal"), &1000, &2000000000);
+
+    let mut snapshot = client.export_snapshot(&owner);
+    snapshot.schema_version = u32::MAX;
+
+    let result = client.try_import_snapshot(&owner, &0, &snapshot);
+    assert_eq!(
+        result,
+        Err(Ok(SavingsGoalError::UnsupportedVersion)),
+        "schema_version = u32::MAX must be rejected"
+    );
+}
+
+/// Nonce replay: after a successful import the nonce is incremented.
+/// Reusing the old nonce (0) on a second import must panic.
+///
+/// # Security note
+/// Nonce replay protection prevents an attacker from replaying a captured
+/// import transaction. Each successful import must consume the nonce.
+#[test]
+#[should_panic]
+fn test_import_snapshot_nonce_replay_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+
+    client.init();
+    client.create_goal(&owner, &String::from_str(&env, "Goal"), &1000, &2000000000);
+
+    let snapshot = client.export_snapshot(&owner);
+
+    // First import with nonce 0 — succeeds and increments nonce to 1.
+    let ok = client.import_snapshot(&owner, &0, &snapshot);
+    assert!(ok);
+
+    // Second import with the same nonce 0 — must panic (nonce mismatch).
+    client.import_snapshot(&owner, &0, &snapshot);
+}
+
+/// Nonce wrong value: supplying an incorrect nonce must panic before any
+/// state mutation occurs.
+///
+/// # Security note
+/// The nonce check is the first guard in import_snapshot. An incorrect nonce
+/// must abort the call immediately, leaving state unchanged.
+#[test]
+#[should_panic]
+fn test_import_snapshot_wrong_nonce_panics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+
+    client.init();
+    client.create_goal(&owner, &String::from_str(&env, "Goal"), &1000, &2000000000);
+
+    let snapshot = client.export_snapshot(&owner);
+    // Nonce is 0 but we supply 42 — must panic.
+    client.import_snapshot(&owner, &42, &snapshot);
+}
+
+/// Sequential imports: nonce increments correctly across multiple successful
+/// imports, and each import with the correct nonce succeeds.
+#[test]
+fn test_import_snapshot_sequential_nonce_increments() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+
+    client.init();
+    client.create_goal(&owner, &String::from_str(&env, "Goal"), &1000, &2000000000);
+
+    let snapshot = client.export_snapshot(&owner);
+
+    // Import 1: nonce 0 → nonce becomes 1
+    assert!(client.import_snapshot(&owner, &0, &snapshot));
+    assert_eq!(client.get_nonce(&owner), 1, "nonce must be 1 after first import");
+
+    // Import 2: nonce 1 → nonce becomes 2
+    assert!(client.import_snapshot(&owner, &1, &snapshot));
+    assert_eq!(client.get_nonce(&owner), 2, "nonce must be 2 after second import");
+}
+
+/// Ownership remap: importing a snapshot whose goals are owned by a different
+/// address must succeed. The import caller authorizes the operation; goal
+/// ownership inside the snapshot is preserved as-is.
+///
+/// # Security note
+/// import_snapshot does not re-assign goal ownership. The caller is
+/// responsible for ensuring the snapshot content is trusted. This test
+/// documents and locks in that behavior.
+#[test]
+fn test_import_snapshot_preserves_original_goal_owner() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let original_owner = Address::generate(&env);
+    let importer = Address::generate(&env);
+
+    client.init();
+    client.create_goal(
+        &original_owner,
+        &String::from_str(&env, "Owned Goal"),
+        &7000,
+        &2000000000,
+    );
+
+    // Export as original_owner, then import as a different caller (importer).
+    let snapshot = client.export_snapshot(&original_owner);
+    let ok = client.import_snapshot(&importer, &0, &snapshot);
+    assert!(ok, "import by a different caller must succeed");
+
+    // Goal ownership must remain with original_owner, not importer.
+    let goal = client.get_goal(&1).expect("goal must exist after import");
+    assert_eq!(
+        goal.owner, original_owner,
+        "goal owner must be preserved from snapshot, not remapped to importer"
+    );
+}
+
+/// Multi-owner snapshot: a snapshot containing goals from multiple owners
+/// must restore all goals with their original owners intact.
+#[test]
+fn test_import_snapshot_multi_owner_goals_preserved() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner_a = Address::generate(&env);
+    let owner_b = Address::generate(&env);
+    let admin = Address::generate(&env);
+
+    client.init();
+    let id_a = client.create_goal(&owner_a, &String::from_str(&env, "A Goal"), &3000, &2000000000);
+    let id_b = client.create_goal(&owner_b, &String::from_str(&env, "B Goal"), &6000, &2000000000);
+
+    // Admin exports the full snapshot (all goals regardless of owner).
+    let snapshot = client.export_snapshot(&admin);
+    assert_eq!(snapshot.goals.len(), 2, "snapshot must contain both goals");
+
+    // Re-import as admin.
+    let ok = client.import_snapshot(&admin, &0, &snapshot);
+    assert!(ok);
+
+    let goal_a = client.get_goal(&id_a).expect("goal A must survive import");
+    let goal_b = client.get_goal(&id_b).expect("goal B must survive import");
+
+    assert_eq!(goal_a.owner, owner_a, "goal A owner must be preserved");
+    assert_eq!(goal_b.owner, owner_b, "goal B owner must be preserved");
+}
+
+/// Import overwrites existing state: goals present before import that are not
+/// in the snapshot must be absent after import.
+///
+/// # Security note
+/// import_snapshot is a full-state replacement, not a merge. Callers must
+/// ensure the snapshot is complete to avoid unintended data loss.
+#[test]
+fn test_import_snapshot_overwrites_existing_goals() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+
+    client.init();
+    // Create goal 1 and export it.
+    client.create_goal(&owner, &String::from_str(&env, "Keep"), &1000, &2000000000);
+    let snapshot = client.export_snapshot(&owner);
+
+    // Create goal 2 after the snapshot was taken.
+    client.create_goal(&owner, &String::from_str(&env, "Discard"), &2000, &2000000000);
+    assert!(client.get_goal(&2).is_some(), "goal 2 must exist before import");
+
+    // Import the earlier snapshot — goal 2 must be gone.
+    let ok = client.import_snapshot(&owner, &0, &snapshot);
+    assert!(ok);
+
+    assert!(client.get_goal(&1).is_some(), "goal 1 must survive import");
+    assert!(
+        client.get_goal(&2).is_none(),
+        "goal 2 must be absent after import of older snapshot"
+    );
+}
+
+/// Audit log: a successful import must append a success entry to the audit log.
+///
+/// # Security note
+/// Every import must be traceable. The audit log provides an immutable record
+/// of who imported what and whether it succeeded.
+#[test]
+fn test_import_snapshot_appends_success_audit_entry() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+
+    client.init();
+    client.create_goal(&owner, &String::from_str(&env, "Goal"), &1000, &2000000000);
+
+    let snapshot = client.export_snapshot(&owner);
+    client.import_snapshot(&owner, &0, &snapshot);
+
+    let log = client.get_audit_log(&0, &10);
+    assert!(log.len() > 0, "audit log must not be empty after import");
+
+    // The last entry must record a successful import.
+    let last = log.get(log.len() - 1).expect("audit log must have entries");
+    assert!(last.success, "last audit entry must be a success");
+}
+
+/// Failed import (bad checksum) must append a failure entry to the audit log.
+///
+/// # Security note
+/// Failed import attempts must also be logged so operators can detect
+/// tampering or misconfigured migration tooling.
+#[test]
+fn test_import_snapshot_failed_checksum_appends_failure_audit_entry() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+
+    client.init();
+    client.create_goal(&owner, &String::from_str(&env, "Goal"), &1000, &2000000000);
+
+    let mut snapshot = client.export_snapshot(&owner);
+    snapshot.checksum = snapshot.checksum.wrapping_add(1);
+
+    let _ = client.try_import_snapshot(&owner, &0, &snapshot);
+
+    let log = client.get_audit_log(&0, &10);
+    assert!(log.len() > 0, "audit log must not be empty after failed import");
+
+    let last = log.get(log.len() - 1).expect("audit log must have entries");
+    assert!(!last.success, "last audit entry must record failure");
+}
+
+/// export_snapshot must emit the (goals, snap_exp) event with the schema version.
+#[test]
+fn test_export_snapshot_emits_event() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+
+    client.init();
+    client.create_goal(&owner, &String::from_str(&env, "Goal"), &1000, &2000000000);
+
+    client.export_snapshot(&owner);
+
+    let events = env.events().all();
+    let found = events.iter().any(|e| {
+        let topics = e.1;
+        if topics.len() < 2 {
+            return false;
+        }
+        let t0 = Symbol::try_from_val(&env, &topics.get(0).unwrap());
+        let t1 = Symbol::try_from_val(&env, &topics.get(1).unwrap());
+        matches!((t0, t1), (Ok(a), Ok(b))
+            if a == symbol_short!("goals") && b == symbol_short!("snap_exp"))
+    });
+    assert!(found, "export_snapshot must emit (goals, snap_exp) event");
+}
+
+/// Version transition: importing a snapshot at schema_version = 2 when
+/// SCHEMA_VERSION = 1 must be rejected (forward-compat guard).
+/// This test documents the expected behavior when a future contract version
+/// produces a snapshot that an older contract cannot safely consume.
+#[test]
+fn test_import_snapshot_version_2_rejected_by_v1_contract() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+
+    client.init();
+    client.create_goal(&owner, &String::from_str(&env, "Goal"), &1000, &2000000000);
+
+    let mut snapshot = client.export_snapshot(&owner);
+    // Simulate a snapshot produced by a v2 contract.
+    snapshot.schema_version = 2;
+
+    let result = client.try_import_snapshot(&owner, &0, &snapshot);
+    assert_eq!(
+        result,
+        Err(Ok(SavingsGoalError::UnsupportedVersion)),
+        "schema_version 2 must be rejected by a v1 contract"
+    );
+}
+
+/// Round-trip with locked goal: a locked goal must remain locked after import.
+#[test]
+fn test_import_snapshot_preserves_locked_state() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+
+    client.init();
+    let id = client.create_goal(&owner, &String::from_str(&env, "Locked"), &1000, &2000000000);
+    // Goals are locked by default; verify before export.
+    assert!(client.get_goal(&id).unwrap().locked);
+
+    let snapshot = client.export_snapshot(&owner);
+    client.import_snapshot(&owner, &0, &snapshot);
+
+    let restored = client.get_goal(&id).expect("goal must exist after import");
+    assert!(restored.locked, "locked state must be preserved through import");
+}
+
+/// Round-trip with time-lock: unlock_date must survive export → import.
+#[test]
+fn test_import_snapshot_preserves_time_lock() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+
+    client.init();
+    set_ledger_time(&env, 1, 1000);
+    let id = client.create_goal(&owner, &String::from_str(&env, "TimeLocked"), &1000, &5000);
+    client.set_time_lock(&owner, &id, &9999);
+
+    let snapshot = client.export_snapshot(&owner);
+    client.import_snapshot(&owner, &0, &snapshot);
+
+    let restored = client.get_goal(&id).expect("goal must exist after import");
+    assert_eq!(
+        restored.unlock_date,
+        Some(9999),
+        "unlock_date must be preserved through import"
+    );
+}
+
+/// Malformed payload: tampering with goal amounts while keeping the original
+/// checksum must be rejected with ChecksumMismatch.
+///
+/// # Security note
+/// Goal amounts are included in the checksum. Any mutation of goal data
+/// without recomputing the checksum must be detected.
+#[test]
+fn test_import_snapshot_tampered_goal_amount_rejected() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+
+    client.init();
+    client.create_goal(&owner, &String::from_str(&env, "Goal"), &5000, &2000000000);
+    client.add_to_goal(&owner, &1, &2000);
+
+    let mut snapshot = client.export_snapshot(&owner);
+
+    // Mutate the first goal's target_amount without updating checksum.
+    // soroban Vec has no set(); rebuild by iterating and replacing index 0.
+    let mut goals_vec = Vec::new(&env);
+    for (i, g) in snapshot.goals.iter().enumerate() {
+        if i == 0 {
+            let mut tampered = g.clone();
+            tampered.target_amount = tampered.target_amount.wrapping_add(1);
+            goals_vec.push_back(tampered);
+        } else {
+            goals_vec.push_back(g);
+        }
+    }
+    snapshot.goals = goals_vec;
+
+    let result = client.try_import_snapshot(&owner, &0, &snapshot);
+    assert_eq!(
+        result,
+        Err(Ok(SavingsGoalError::ChecksumMismatch)),
+        "tampered goal amount must be detected via checksum"
+    );
+}
+
 #[test]
 fn test_withdraw_time_lock_boundaries() {
     let env = Env::default();
