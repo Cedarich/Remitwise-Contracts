@@ -88,6 +88,45 @@ pub const CONTRACT_VERSION: u32 = 1;
 pub const MAX_BATCH_SIZE: u32 = 50;
 
 /// Helper function to clamp limit
+///
+/// # Behavior Contract
+///
+/// `clamp_limit` normalises a caller-supplied page-size value so that every
+/// pagination call in the workspace uses a consistent, bounded limit.
+///
+/// ## Rules (in evaluation order)
+///
+/// | Input condition          | Returned value        | Rationale                                      |
+/// |--------------------------|----------------------|------------------------------------------------|
+/// | `limit == 0`             | `DEFAULT_PAGE_LIMIT` | Zero is treated as "use the default".          |
+/// | `limit > MAX_PAGE_LIMIT` | `MAX_PAGE_LIMIT`     | Cap to prevent unbounded storage reads.        |
+/// | otherwise                | `limit`              | Caller value is within the valid range.        |
+///
+/// ## Invariants
+///
+/// - The return value is always in the range `[1, MAX_PAGE_LIMIT]`.
+/// - `clamp_limit(0) == DEFAULT_PAGE_LIMIT` (default substitution).
+/// - `clamp_limit(MAX_PAGE_LIMIT) == MAX_PAGE_LIMIT` (boundary is inclusive).
+/// - `clamp_limit(MAX_PAGE_LIMIT + 1) == MAX_PAGE_LIMIT` (cap is enforced).
+/// - The function is pure and has no side effects.
+///
+/// ## Security Assumptions
+///
+/// - Callers must not rely on receiving a value larger than `MAX_PAGE_LIMIT`.
+/// - A zero input is **not** an error; it is silently replaced with the default.
+///   Contracts that need to distinguish "no limit requested" from "default limit"
+///   should inspect the raw input before calling this function.
+///
+/// ## Usage
+///
+/// ```rust
+/// use remitwise_common::{clamp_limit, DEFAULT_PAGE_LIMIT, MAX_PAGE_LIMIT};
+///
+/// assert_eq!(clamp_limit(0),                  DEFAULT_PAGE_LIMIT);
+/// assert_eq!(clamp_limit(10),                 10);
+/// assert_eq!(clamp_limit(MAX_PAGE_LIMIT),     MAX_PAGE_LIMIT);
+/// assert_eq!(clamp_limit(MAX_PAGE_LIMIT + 1), MAX_PAGE_LIMIT);
+/// ```
 pub fn clamp_limit(limit: u32) -> u32 {
     if limit == 0 {
         DEFAULT_PAGE_LIMIT
