@@ -17,6 +17,7 @@
 9. [Running Tests](#running-tests)
 10. [Integration Guide](#integration-guide)
 11. [Security Notes](#security-notes)
+12. [Security Assumptions](#security-assumptions)
 
 ---
 
@@ -278,6 +279,42 @@ Returns the full `Policy` record. Panics if the policy does not exist.
 
 Returns the sum of `monthly_premium` across all active policies.
 Uses `saturating_add` to prevent overflow on extremely large portfolios.
+
+---
+
+### `add_tag(caller, policy_id, tag)`
+
+Attaches a string label to a policy. Duplicate tags are silently ignored.
+
+**Parameters**
+
+| Parameter   | Type      | Description                                              |
+|-------------|-----------|----------------------------------------------------------|
+| `caller`    | `Address` | Must be the policy owner or contract admin (must sign)   |
+| `policy_id` | `u32`     | ID of the target policy                                  |
+| `tag`       | `String`  | Label to attach (1–32 bytes, case-sensitive)             |
+
+**Emits**: `("insure", "tag_added")` with data `(policy_id, tag)` — only when
+the tag is new. No event is emitted for a duplicate call.
+
+---
+
+### `remove_tag(caller, policy_id, tag)`
+
+Removes a string label from a policy. If the tag is not present the function
+returns gracefully without panicking.
+
+**Parameters**
+
+| Parameter   | Type      | Description                                              |
+|-------------|-----------|----------------------------------------------------------|
+| `caller`    | `Address` | Must be the policy owner or contract admin (must sign)   |
+| `policy_id` | `u32`     | ID of the target policy                                  |
+| `tag`       | `String`  | Label to remove (case-sensitive)                         |
+
+**Emits**:
+- `("insure", "tag_rmvd")` with data `(policy_id, tag)` when the tag was found and removed.
+- `("insure", "tag_miss")` with data `(policy_id, tag)` when the tag was not present.
 
 ---
 
