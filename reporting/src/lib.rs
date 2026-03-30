@@ -498,12 +498,11 @@ impl ReportingContract {
         period_start: u64,
         period_end: u64,
     ) -> RemittanceSummary {
-        user.require_auth();
-        let addresses: ContractAddresses = env
+        let addresses: Option<ContractAddresses> = env
             .storage()
             .instance()
             .get(&symbol_short!("ADDRS"));
-            
+
         if addresses.is_none() {
             return RemittanceSummary {
                 total_received: total_amount,
@@ -514,12 +513,27 @@ impl ReportingContract {
                 data_availability: DataAvailability::Missing,
             };
         }
-        
+
         let addresses = addresses.unwrap();
 
         let split_client = RemittanceSplitClient::new(env, &addresses.remittance_split);
-        let split_percentages = split_client.get_split();
-        let split_amounts = split_client.calculate_split(&total_amount);
+        let mut availability = DataAvailability::Complete;
+
+        let split_percentages = match split_client.try_get_split() {
+            Ok(Ok(res)) => res,
+            _ => {
+                availability = DataAvailability::Partial;
+                Vec::new(env)
+            }
+        };
+
+        let split_amounts = match split_client.try_calculate_split(&total_amount) {
+            Ok(Ok(res)) => res,
+            _ => {
+                availability = DataAvailability::Partial;
+                Vec::new(env)
+            }
+        };
 
         let mut breakdown = Vec::new(env);
         let categories = [
