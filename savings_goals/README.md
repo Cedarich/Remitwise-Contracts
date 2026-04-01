@@ -563,7 +563,6 @@ cargo test -p data_migration
 # savings_goals package (contract + cross-package e2e tests)
 cargo test -p savings_goals
 ```
-
 ### Savings Schedule Security
 
 | Threat | Mitigation |

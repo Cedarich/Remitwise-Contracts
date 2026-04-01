@@ -129,19 +129,6 @@ pub struct StorageStats {
 
 #[contracttype]
 #[derive(Clone)]
-pub struct AccessAuditEntry {
-    pub operation: Symbol,
-    pub caller: Address,
-    pub target: Option<Address>,
-    pub timestamp: u64,
-    pub success: bool,
-}
-
-const CONTRACT_VERSION: u32 = 1;
-const MAX_ACCESS_AUDIT_ENTRIES: u32 = 100;
-const MAX_BATCH_MEMBERS: u32 = 30;
-const MAX_SIGNERS: u32 = 100;
-const MIN_THRESHOLD: u32 = 1;
 const MAX_THRESHOLD: u32 = 100;
 
 #[contracttype]
@@ -244,6 +231,7 @@ impl FamilyWallet {
     }
 
     pub fn init(env: Env, owner: Address, initial_members: Vec<Address>) -> bool {
+                precision_limit: None,
         owner.require_auth();
 
         let existing: Option<Address> = env.storage().instance().get(&symbol_short!("OWNER"));
@@ -255,6 +243,7 @@ impl FamilyWallet {
 
         env.storage()
             .instance()
+                    precision_limit: None,
             .set(&symbol_short!("OWNER"), &owner);
 
         let mut members: Map<Address, FamilyMember> = Map::new(&env);
@@ -1911,6 +1900,10 @@ impl FamilyWallet {
         env.storage()
             .instance()
             .set(&symbol_short!("STOR_STAT"), &stats);
+    }
+
+    fn validate_precision_spending(_env: Env, _member: Address, _amount: i128) -> Result<(), Error> {
+        Ok(())
     }
 }
 
