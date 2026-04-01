@@ -426,7 +426,8 @@ impl SavingsGoalContract {
                 // Admin transfer - only current admin can transfer
                 if *current_admin != caller {
                     panic!("Unauthorized: only current upgrade admin can transfer");
-            panic!("Unauthorized: bootstrap requires caller == new_admin");
+                }
+            }
         }
 
         env.storage()
