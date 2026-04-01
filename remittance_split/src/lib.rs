@@ -25,18 +25,44 @@ pub struct SplitInitializedEvent {
     pub timestamp: u64,
 }
 
+/// Domain-separated authorization payload for `initialize_split`.
+/// Passed to `require_auth_for_args` to bind the authorization to the
+/// specific operation parameters, preventing replay across different calls.
+#[derive(Clone, Debug, Eq, PartialEq)]
+#[contracttype]
+pub struct SplitAuthPayload {
+    pub domain_id: Symbol,
+    pub network_id: BytesN<32>,
+    pub contract_addr: Address,
+    pub owner_addr: Address,
+    pub nonce_val: u64,
+    pub usdc_contract: Address,
+    pub spending_percent: u32,
+    pub savings_percent: u32,
+    pub bills_percent: u32,
+    pub insurance_percent: u32,
+}
+
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum RemittanceSplitError {
     AlreadyInitialized = 1,
+    /// The contract has not been initialized yet; `initialize_split` must be called first.
     NotInitialized = 2,
+    /// One or more split percentages are invalid: either a field exceeds 100 or the four
+    /// fields do not sum to exactly 100.
     InvalidPercentages = 3,
     InvalidAmount = 4,
     Overflow = 5,
+    /// The caller is not authorized to perform this operation.
     Unauthorized = 6,
     InvalidNonce = 7,
+    /// The snapshot's `schema_version` is outside the supported range
+    /// `[MIN_SUPPORTED_SCHEMA_VERSION, SCHEMA_VERSION]`.
     UnsupportedVersion = 8,
+    /// The snapshot's `checksum` field does not match the value computed from its contents;
+    /// the payload may have been tampered with or corrupted.
     ChecksumMismatch = 9,
     InvalidDueDate = 10,
     ScheduleNotFound = 11,
@@ -1022,7 +1048,9 @@ impl RemittanceSplit {
         }))
     }
 
-    /// Import a previously exported snapshot after validating version and checksum.
+    /// Import a previously exported snapshot, restoring the full `SplitConfig` and
+    /// associated `RemittanceSchedule` list to on-chain storage after running the
+    /// complete validation pipeline.
     ///
     /// # Arguments
     /// * `caller` - Split owner address (must authorize)
@@ -1030,12 +1058,26 @@ impl RemittanceSplit {
     /// * `snapshot` - Serialized configuration snapshot to restore
     ///
     /// # Errors
-    /// - `Unauthorized` if `caller` is not the split owner or the contract is paused
-    /// - `InvalidNonce` if the replay-protection nonce does not match
-    /// - `UnsupportedVersion` if the snapshot schema version is not supported
-    /// - `ChecksumMismatch` if the snapshot checksum is invalid
-    /// - `PercentagesDoNotSumTo100` if the imported configuration is malformed
-    /// - `NotInitialized` if no existing configuration is present to authorize the caller
+    /// * `UnsupportedVersion` — `snapshot.schema_version` is outside
+    ///   `[MIN_SUPPORTED_SCHEMA_VERSION, SCHEMA_VERSION]`.
+    /// * `ChecksumMismatch` — `snapshot.checksum` does not match the value computed
+    ///   by `compute_checksum` over the snapshot fields.
+    /// * `SnapshotNotInitialized` — `snapshot.config.initialized` is `false`; the
+    ///   snapshot represents an incomplete or factory-default configuration.
+    /// * `InvalidPercentageRange` — at least one of `spending_percent`,
+    ///   `savings_percent`, `bills_percent`, or `insurance_percent` exceeds `100`.
+    /// * `InvalidPercentages` — all four percentage fields are within `[0, 100]` but
+    ///   their sum is not equal to `100`.
+    /// * `InvalidAmount` — `snapshot.config.timestamp` is greater than the current
+    ///   ledger timestamp, indicating a future-dated or replayed payload.
+    /// * `Unauthorized` — `caller` is not the current on-chain owner stored in
+    ///   instance storage, or the contract is paused.
+    /// * `OwnerMismatch` — `snapshot.config.owner` does not equal `caller`, which
+    ///   would silently transfer ownership if allowed.
+    /// * `NotInitialized` — no existing `SplitConfig` is present in instance storage
+    ///   (the contract has not been initialized).
+    /// * `InvalidNonce` — the provided `nonce` has already been used or does not
+    ///   match the expected replay-protection value for `caller`.
     pub fn import_snapshot(
         env: Env,
         caller: Address,
@@ -1084,7 +1126,7 @@ impl RemittanceSplit {
             + snapshot.config.insurance_percent;
         if total != 100 {
             Self::append_audit(&env, symbol_short!("import"), &caller, false);
-            return Err(RemittanceSplitError::InvalidPercentages);
+            return Err(e);
         }
 
         // 6. Timestamp sanity — reject payloads whose timestamps are in the future.
@@ -1157,29 +1199,41 @@ impl RemittanceSplit {
 
     /// Verify snapshot integrity without importing it.
     ///
-    /// Runs the same checks as `import_snapshot` (version boundary, checksum,
-    /// initialized flag, per-field range, sum constraint, and timestamp sanity)
-    /// **without** modifying any contract state. Use this as a pre-flight check
-    /// before calling `import_snapshot`.
+    /// Runs the same validation pipeline as `import_snapshot` steps 2–7 — schema
+    /// version boundary, checksum integrity, initialized flag, per-field percentage
+    /// range, percentage sum constraint, and timestamp sanity — **without** modifying
+    /// any contract state. Use this as a read-only pre-flight check before calling
+    /// `import_snapshot`.
     ///
-    /// Returns `Ok(true)` when the snapshot is valid and ready to import.
-    /// Returns an error variant describing the first failing check.
+    /// Returns `Ok(true)` when all checks pass and the snapshot is ready to import.
+    ///
+    /// # Errors
+    /// - `UnsupportedVersion` — `snapshot.schema_version` is outside
+    ///   `[MIN_SUPPORTED_SCHEMA_VERSION, SCHEMA_VERSION]`.
+    /// - `ChecksumMismatch` — the stored checksum does not match the freshly
+    ///   computed digest over the snapshot fields.
+    /// - `SnapshotNotInitialized` — `snapshot.config.initialized` is `false`.
+    /// - `InvalidPercentageRange` — at least one of the four percentage fields
+    ///   individually exceeds `100`.
+    /// - `InvalidPercentages` — all four fields are ≤ 100 but their sum is not `100`.
+    /// - `InvalidAmount` — `snapshot.config.timestamp` is greater than the current
+    ///   ledger timestamp (future-dated payload).
     ///
     /// # Note
-    /// This function does **not** verify ownership mapping (that requires knowing
-    /// which address will perform the import) or nonce validity.
+    /// This function does **not** check ownership mapping or nonce validity; those
+    /// require a specific caller context and are only enforced by `import_snapshot`.
     pub fn verify_snapshot(
         env: Env,
         snapshot: ExportSnapshot,
     ) -> Result<bool, RemittanceSplitError> {
-        // 1. Version boundary
+        // Step 2. Schema version boundary
         if snapshot.schema_version < MIN_SUPPORTED_SCHEMA_VERSION
             || snapshot.schema_version > SCHEMA_VERSION
         {
             return Err(RemittanceSplitError::UnsupportedVersion);
         }
 
-        // 2. Checksum
+        // Step 3. Checksum integrity
         let expected = Self::compute_checksum(
             snapshot.schema_version,
             &snapshot.config,
@@ -1189,7 +1243,7 @@ impl RemittanceSplit {
             return Err(RemittanceSplitError::ChecksumMismatch);
         }
 
-        // 3. Initialized flag
+        // Step 4. Initialized flag
         if !snapshot.config.initialized {
             return Err(RemittanceSplitError::NotInitialized);
         }
