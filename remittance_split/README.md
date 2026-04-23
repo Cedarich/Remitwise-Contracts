@@ -14,6 +14,12 @@ The Remittance Split contract manages percentage-based allocations for incoming 
 - Access control for configuration management
 - Event emission for audit trails
 - Backward compatibility with vector-based storage
+- **NEW**: Typed request-hash helpers for deterministic `distribute_usdc` signing (SC-001)
+
+## Documentation
+
+- [REQUEST_HASH_SIGNER_GUIDE.md](REQUEST_HASH_SIGNER_GUIDE.md) - Complete guide for using request hash helpers for secure USDC distribution signing
+- [API Reference](#api-reference) - Contract function documentation
 
 ## Quickstart
 
@@ -23,6 +29,7 @@ This section provides a minimal example of how to interact with the Remittance S
 - The configured percentages MUST sum up exactly to 100.
 - `initialize_split` must be called with a valid `nonce` for replay protection.
 - To execute actual underlying asset transfers, use `distribute_usdc` rather than just calculating numbers.
+- For secure USDC distribution with signing, use `distribute_usdc_with_hash_and_deadline` with a request hash (see REQUEST_HASH_SIGNER_GUIDE.md)
 
 ### Write Example: Initializing the Split
 *Note: This is pseudo-code demonstrating the Soroban Rust SDK CLI or client approach.*
