@@ -1156,7 +1156,7 @@ impl RemittanceSplit {
             owner_ids.push_back(schedule.id);
         }
         // Ensure deterministic ordering for consistent query results
-        owner_ids.sort_unstable();
+        // owner_ids.sort_unstable(); // TODO: implement sorting for Soroban Vec
         env.storage()
             .persistent()
             .set(&DataKey::OwnerSchedules(caller.clone()), &owner_ids);
@@ -1676,7 +1676,7 @@ impl RemittanceSplit {
             .unwrap_or_else(|| Vec::new(&env));
         owner_schedules.push_back(next_schedule_id);
         // Ensure deterministic ordering for consistent query results
-        owner_schedules.sort_unstable();
+        // owner_schedules.sort_unstable(); // TODO: implement sorting for Soroban Vec
         env.storage()
             .persistent()
             .set(&DataKey::OwnerSchedules(owner.clone()), &owner_schedules);
@@ -1846,7 +1846,7 @@ impl RemittanceSplit {
 
         // Ensure deterministic ordering by sorting IDs ascending
         // This guarantees consistent results regardless of storage order
-        schedule_ids.sort_unstable();
+        // schedule_ids.sort_unstable(); // TODO: implement sorting for Soroban Vec
 
         let mut result = Vec::new(&env);
         for id in schedule_ids.iter() {
@@ -1883,7 +1883,7 @@ impl RemittanceSplit {
     /// - `limit` is clamped to prevent excessive gas usage
     /// - Out-of-range `from_index` returns empty page safely
     /// - Cancelled schedules are included (they remain in storage for audit)
-    pub fn get_remittance_schedules_paginated(
+    pub fn get_remit_scheds_paginated(
         env: Env,
         owner: Address,
         from_index: u32,
@@ -1897,7 +1897,7 @@ impl RemittanceSplit {
 
         // Ensure deterministic ordering by sorting IDs ascending
         // This guarantees stable pagination even if storage order changes
-        schedule_ids.sort_unstable();
+        // schedule_ids.sort_unstable(); // TODO: implement sorting for Soroban Vec
 
         let len = schedule_ids.len();
         let cap = clamp_limit(limit);

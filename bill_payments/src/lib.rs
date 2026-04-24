@@ -722,7 +722,7 @@ impl BillPayments {
                 &env,
                 EventCategory::State,
                 EventPriority::Medium,
-                symbol_short!("recurring_created"),
+                symbol_short!("recur_crtd"),
                 (next_id, bill.owner.clone(), bill.amount, next_due_date),
             );
         }
