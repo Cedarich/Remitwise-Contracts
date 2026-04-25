@@ -156,6 +156,7 @@ pub enum BillEvent {
     ScheduleMissed,
     ScheduleModified,
     ScheduleCancelled,
+    RecurringBillCreated,
 }
 
 #[derive(Clone, Debug)]
@@ -829,7 +830,7 @@ impl BillPayments {
             paid: false,
             created_at: current_time,
             paid_at: None,
-            schedule_id: None,
+            schedule_id,
             tags: Vec::new(&env),
             currency: resolved_currency,
         };
