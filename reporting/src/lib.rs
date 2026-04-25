@@ -24,6 +24,10 @@ pub const ARCHIVE_LIFETIME_THRESHOLD: u32 = 1 * DAY_IN_LEDGERS; // 1 day
 /// callers know the aggregate may be incomplete.
 pub const MAX_DEP_PAGES: u32 = 20;
 
+/// Page size for dependency queries. This is the maximum number of items
+/// fetched per page from bill-payments and insurance contracts.
+pub const DEP_PAGE_LIMIT: u32 = 50;
+
 /// Financial health score (0-100)
 #[contracttype]
 #[derive(Clone)]
@@ -896,7 +900,7 @@ impl ReportingContract {
         let mut cursor = 0u32;
         let mut pages_fetched = 0u32;
         loop {
-            let page = bill_client.get_all_bills_for_owner(&user, &cursor, &50u32);
+            let page = bill_client.get_all_bills_for_owner(&user, &cursor, &DEP_PAGE_LIMIT);
             for bill in page.items.iter() {
                 if bill.created_at < period_start || bill.created_at > period_end {
                     continue;
@@ -988,7 +992,7 @@ impl ReportingContract {
         let mut cursor = 0u32;
         let mut pages_fetched = 0u32;
         loop {
-            let page = insurance_client.get_active_policies(&user, &cursor, &50);
+            let page = insurance_client.get_active_policies(&user, &cursor, &DEP_PAGE_LIMIT);
             for policy in page.items.iter() {
                 active_policies += 1;
                 total_coverage += policy.coverage_amount;
