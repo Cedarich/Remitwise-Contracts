@@ -1,522 +1,701 @@
-use crate::{Orchestrator, OrchestratorClient, OrchestratorError};
-use soroban_sdk::{contract, contractimpl, Address, Env, Vec};
-use testutils::{generate_test_address, setup_test_env};
-
-// ============================================================================
-// Mock Contract Implementations
-// ============================================================================
-
-/// Mock Family Wallet contract for testing
-#[contract]
-pub struct MockFamilyWallet;
-
-#[contractimpl]
-impl MockFamilyWallet {
-    /// Mock implementation of check_spending_limit
-    /// Returns true if amount <= 10000 (simulating a spending limit)
-    pub fn check_spending_limit(_env: Env, _caller: Address, amount: i128) -> bool {
-        amount <= 10000
-    }
-}
-
-/// Mock Remittance Split contract for testing
-#[contract]
-pub struct MockRemittanceSplit;
-
-#[contractimpl]
-impl MockRemittanceSplit {
-    /// Mock implementation of calculate_split
-    /// Returns [40%, 30%, 20%, 10%] split
-    pub fn calculate_split(env: Env, total_amount: i128) -> Vec<i128> {
-        let spending = (total_amount * 40) / 100;
-        let savings = (total_amount * 30) / 100;
-        let bills = (total_amount * 20) / 100;
-        let insurance = (total_amount * 10) / 100;
-
-        Vec::from_array(&env, [spending, savings, bills, insurance])
-    }
-}
-
-/// Mock Savings Goals contract for testing
-#[contract]
-pub struct MockSavingsGoals;
-
-#[contractimpl]
-impl MockSavingsGoals {
-    /// Mock implementation of add_to_goal
-    /// Panics if goal_id == 999 (simulating goal not found)
-    pub fn add_to_goal(_env: Env, _caller: Address, goal_id: u32, amount: i128) -> i128 {
-        if goal_id == 999 {
-            panic!("Goal not found");
-        }
-        amount
-    }
-}
-
-/// Mock Bill Payments contract for testing
-#[contract]
-pub struct MockBillPayments;
-
-#[contractimpl]
-impl MockBillPayments {
-    /// Mock implementation of pay_bill
-    /// Panics if bill_id == 999 (simulating bill not found or already paid)
-    pub fn pay_bill(_env: Env, _caller: Address, bill_id: u32) {
-        if bill_id == 999 {
-            panic!("Bill not found or already paid");
-        }
-    }
-}
-
-/// Mock Insurance contract for testing
-#[contract]
-pub struct MockInsurance;
-
-#[contractimpl]
-impl MockInsurance {
-    /// Mock implementation of pay_premium
-    /// Returns false if policy_id == 999 (simulating inactive policy)
-    pub fn pay_premium(_env: Env, _caller: Address, policy_id: u32) -> bool {
-        policy_id != 999
-    }
-}
-
-// ============================================================================
-// Integration Tests
-// ============================================================================
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use soroban_sdk::{testutils::Address as TestAddress, Env};
 
-    /// Set up test environment with all contracts deployed
-    fn setup_test_env() -> (
-        Env,
-        Address,
-        Address,
-        Address,
-        Address,
-        Address,
-        Address,
-        Address,
-    ) {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        // Register and deploy all contracts
-        let orchestrator_id = env.register_contract(None, Orchestrator);
-        let family_wallet_id = env.register_contract(None, MockFamilyWallet);
-        let remittance_split_id = env.register_contract(None, MockRemittanceSplit);
-        let savings_id = env.register_contract(None, MockSavingsGoals);
-        let bills_id = env.register_contract(None, MockBillPayments);
-        let insurance_id = env.register_contract(None, MockInsurance);
-
-        // Create test user address
-        let user = generate_test_address(&env);
-
-        (
-            env,
-            orchestrator_id,
-            family_wallet_id,
-            remittance_split_id,
-            savings_id,
-            bills_id,
-            insurance_id,
-            user,
-        )
+    fn create_test_env() -> Env {
+        Env::default()
     }
 
     #[test]
-    fn test_execute_savings_deposit_succeeds() {
-        let (
-            env,
-            orchestrator_id,
-            family_wallet_id,
-            _remittance_split_id,
-            savings_id,
-            _bills_id,
-            _insurance_id,
-            user,
-        ) = setup_test_env();
+    fn test_init_success() {
+        let env = create_test_env();
+        let owner = TestAddress::random(&env);
+        let fw = TestAddress::random(&env);
+        let rs = TestAddress::random(&env);
+        let sg = TestAddress::random(&env);
+        let bp = TestAddress::random(&env);
+        let ins = TestAddress::random(&env);
 
-        let client = OrchestratorClient::new(&env, &orchestrator_id);
-
-        // Execute savings deposit with amount within limit (5000 <= 10000)
-        let result = client.try_execute_savings_deposit(
-            &user,
-            &5000,
-            &family_wallet_id,
-            &savings_id,
-            &1, // goal_id
+        let result = Orchestrator::init(
+            env.clone(),
+            owner.clone(),
+            fw,
+            rs,
+            sg,
+            bp,
+            ins,
         );
 
-        // Should succeed
-        assert!(result.is_ok());
+        assert_eq!(result, Ok(true));
+
+        // Verify stored addresses
+        let stored_owner: Option<Address> =
+            env.storage().instance().get(&symbol_short!("OWNER"));
+        assert_eq!(stored_owner, Some(owner));
     }
 
     #[test]
-    fn test_execute_savings_deposit_invalid_goal_fails() {
-        let (
-            env,
-            orchestrator_id,
-            family_wallet_id,
-            _remittance_split_id,
-            savings_id,
-            _bills_id,
-            _insurance_id,
-            user,
-        ) = setup_test_env();
+    fn test_init_already_initialized() {
+        let env = create_test_env();
+        let owner = TestAddress::random(&env);
+        let fw = TestAddress::random(&env);
+        let rs = TestAddress::random(&env);
+        let sg = TestAddress::random(&env);
+        let bp = TestAddress::random(&env);
+        let ins = TestAddress::random(&env);
 
-        let client = OrchestratorClient::new(&env, &orchestrator_id);
-
-        // Execute savings deposit with invalid goal_id (999)
-        // This should fail with SavingsDepositFailed error
-        let result = client.try_execute_savings_deposit(
-            &user,
-            &5000,
-            &family_wallet_id,
-            &savings_id,
-            &999, // invalid goal_id
+        // First init should succeed
+        let _result = Orchestrator::init(
+            env.clone(),
+            owner.clone(),
+            fw.clone(),
+            rs.clone(),
+            sg.clone(),
+            bp.clone(),
+            ins.clone(),
         );
 
-        // Should fail (the mock will panic, which gets caught and converted to error)
-        assert!(result.is_err());
+        // Second init should fail
+        let result = Orchestrator::init(
+            env.clone(),
+            owner.clone(),
+            fw,
+            rs,
+            sg,
+            bp,
+            ins,
+        );
+
+        assert_eq!(result, Err(OrchestratorError::Unauthorized));
     }
 
     #[test]
-    fn test_execute_savings_deposit_spending_limit_exceeded_fails() {
-        let (
-            env,
-            orchestrator_id,
-            family_wallet_id,
-            _remittance_split_id,
-            savings_id,
-            _bills_id,
-            _insurance_id,
-            user,
-        ) = setup_test_env();
+    fn test_init_duplicate_dependencies() {
+        let env = create_test_env();
+        let owner = TestAddress::random(&env);
+        let fw = TestAddress::random(&env);
+        let rs = TestAddress::random(&env);
+        let sg = TestAddress::random(&env);
+        let bp = TestAddress::random(&env);
 
-        let client = OrchestratorClient::new(&env, &orchestrator_id);
-
-        // Execute savings deposit with amount exceeding limit (15000 > 10000)
-        let result = client.try_execute_savings_deposit(
-            &user,
-            &15000,
-            &family_wallet_id,
-            &savings_id,
-            &1, // goal_id
+        // Pass same address for savings_goals and bill_payments
+        let result = Orchestrator::init(
+            env.clone(),
+            owner.clone(),
+            fw,
+            rs,
+            sg.clone(),
+            sg, // Duplicate!
+            bp,
         );
 
-        // Should fail - the mock returns false for amounts > 10000
-        // This gets interpreted as PermissionDenied (since check_spending_limit
-        // and check_family_wallet_permission use the same mock function)
-        assert!(result.is_err());
+        assert_eq!(result, Err(OrchestratorError::DuplicateDependency));
+    }
+
+    #[test]
+    fn test_init_self_reference() {
+        let env = create_test_env();
+        let caller = TestAddress::random(&env);
+        let other = TestAddress::random(&env);
+        let another = TestAddress::random(&env);
+        let third = TestAddress::random(&env);
+        let fourth = TestAddress::random(&env);
+
+        // Pass caller as one of the dependencies
+        let result = Orchestrator::init(
+            env.clone(),
+            caller.clone(),
+            caller, // Self-reference!
+            other,
+            another,
+            third,
+            fourth,
+        );
+
+        assert_eq!(result, Err(OrchestratorError::DuplicateDependency));
+    }
+
+    #[test]
+    fn test_get_nonce_uninitialized() {
+        let env = create_test_env();
+        let user = TestAddress::random(&env);
+
+        let nonce = Orchestrator::get_nonce(env, user);
+        assert_eq!(nonce, 0);
+    }
+
+    #[test]
+    fn test_execute_flow_invalid_amount() {
+        let env = create_test_env();
+        let owner = TestAddress::random(&env);
+        let fw = TestAddress::random(&env);
+        let rs = TestAddress::random(&env);
+        let sg = TestAddress::random(&env);
+        let bp = TestAddress::random(&env);
+        let ins = TestAddress::random(&env);
+
+        let _init = Orchestrator::init(
+            env.clone(),
+            owner.clone(),
+            fw,
+            rs,
+            sg,
+            bp,
+            ins,
+        );
+
+        let executor = TestAddress::random(&env);
+        env.budget().reset_unlimited();
+
+        let now = env.ledger().timestamp();
+        let deadline = now + 1000;
+        let request_hash = Orchestrator::compute_request_hash(
+            symbol_short!("flow"),
+            executor.clone(),
+            0,
+            0,
+            deadline,
+        );
+
+        let result = Orchestrator::execute_remittance_flow(
+            env,
+            executor,
+            0, // Invalid: amount must be > 0
+            0,
+            deadline,
+            request_hash,
+        );
+
+        assert_eq!(result, Err(OrchestratorError::InvalidAmount));
+    }
+
+    #[test]
+    fn test_execute_flow_invalid_nonce() {
+        let env = create_test_env();
+        let owner = TestAddress::random(&env);
+        let fw = TestAddress::random(&env);
+        let rs = TestAddress::random(&env);
+        let sg = TestAddress::random(&env);
+        let bp = TestAddress::random(&env);
+        let ins = TestAddress::random(&env);
+
+        let _init = Orchestrator::init(
+            env.clone(),
+            owner.clone(),
+            fw,
+            rs,
+            sg,
+            bp,
+            ins,
+        );
+
+        let executor = TestAddress::random(&env);
+        env.budget().reset_unlimited();
+
+        let now = env.ledger().timestamp();
+        let deadline = now + 1000;
+        let request_hash = Orchestrator::compute_request_hash(
+            symbol_short!("flow"),
+            executor.clone(),
+            5, // Wrong nonce (current is 0)
+            100,
+            deadline,
+        );
+
+        let result = Orchestrator::execute_remittance_flow(
+            env,
+            executor,
+            100,
+            5,
+            deadline,
+            request_hash,
+        );
+
+        assert_eq!(result, Err(OrchestratorError::InvalidNonce));
+    }
+
+    #[test]
+    fn test_execute_flow_expired_deadline() {
+        let env = create_test_env();
+        let owner = TestAddress::random(&env);
+        let fw = TestAddress::random(&env);
+        let rs = TestAddress::random(&env);
+        let sg = TestAddress::random(&env);
+        let bp = TestAddress::random(&env);
+        let ins = TestAddress::random(&env);
+
+        let _init = Orchestrator::init(
+            env.clone(),
+            owner.clone(),
+            fw,
+            rs,
+            sg,
+            bp,
+            ins,
+        );
+
+        let executor = TestAddress::random(&env);
+        env.budget().reset_unlimited();
+
+        let now = env.ledger().timestamp();
+        let deadline = now - 100; // Past deadline
+        let request_hash = Orchestrator::compute_request_hash(
+            symbol_short!("flow"),
+            executor.clone(),
+            0,
+            100,
+            deadline,
+        );
+
+        let result = Orchestrator::execute_remittance_flow(
+            env,
+            executor,
+            100,
+            0,
+            deadline,
+            request_hash,
+        );
+
+        assert_eq!(result, Err(OrchestratorError::DeadlineExpired));
+    }
+
+    #[test]
+    fn test_execute_flow_deadline_too_far_future() {
+        let env = create_test_env();
+        let owner = TestAddress::random(&env);
+        let fw = TestAddress::random(&env);
+        let rs = TestAddress::random(&env);
+        let sg = TestAddress::random(&env);
+        let bp = TestAddress::random(&env);
+        let ins = TestAddress::random(&env);
+
+        let _init = Orchestrator::init(
+            env.clone(),
+            owner.clone(),
+            fw,
+            rs,
+            sg,
+            bp,
+            ins,
+        );
+
+        let executor = TestAddress::random(&env);
+        env.budget().reset_unlimited();
+
+        let now = env.ledger().timestamp();
+        let deadline = now + MAX_DEADLINE_WINDOW_SECS + 1000; // Too far in future
+        let request_hash = Orchestrator::compute_request_hash(
+            symbol_short!("flow"),
+            executor.clone(),
+            0,
+            100,
+            deadline,
+        );
+
+        let result = Orchestrator::execute_remittance_flow(
+            env,
+            executor,
+            100,
+            0,
+            deadline,
+            request_hash,
+        );
+
+        assert_eq!(result, Err(OrchestratorError::DeadlineExpired));
+    }
+
+    #[test]
+    fn test_execute_flow_invalid_hash() {
+        let env = create_test_env();
+        let owner = TestAddress::random(&env);
+        let fw = TestAddress::random(&env);
+        let rs = TestAddress::random(&env);
+        let sg = TestAddress::random(&env);
+        let bp = TestAddress::random(&env);
+        let ins = TestAddress::random(&env);
+
+        let _init = Orchestrator::init(
+            env.clone(),
+            owner.clone(),
+            fw,
+            rs,
+            sg,
+            bp,
+            ins,
+        );
+
+        let executor = TestAddress::random(&env);
+        env.budget().reset_unlimited();
+
+        let now = env.ledger().timestamp();
+        let deadline = now + 1000;
+
+        let result = Orchestrator::execute_remittance_flow(
+            env,
+            executor,
+            100,
+            0,
+            deadline,
+            12345, // Wrong hash
+        );
+
+        assert_eq!(result, Err(OrchestratorError::InvalidNonce));
+    }
+
+    #[test]
+    fn test_execute_flow_success_and_nonce_increment() {
+        let env = create_test_env();
+        let owner = TestAddress::random(&env);
+        let fw = TestAddress::random(&env);
+        let rs = TestAddress::random(&env);
+        let sg = TestAddress::random(&env);
+        let bp = TestAddress::random(&env);
+        let ins = TestAddress::random(&env);
+
+        let _init = Orchestrator::init(
+            env.clone(),
+            owner.clone(),
+            fw,
+            rs,
+            sg,
+            bp,
+            ins,
+        );
+
+        let executor = TestAddress::random(&env);
+        env.budget().reset_unlimited();
+
+        let now = env.ledger().timestamp();
+        let deadline = now + 1000;
+
+        // Verify initial nonce is 0
+        assert_eq!(Orchestrator::get_nonce(env.clone(), executor.clone()), 0);
+
+        let request_hash = Orchestrator::compute_request_hash(
+            symbol_short!("flow"),
+            executor.clone(),
+            0,
+            100,
+            deadline,
+        );
+
+        let result = Orchestrator::execute_remittance_flow(
+            env.clone(),
+            executor.clone(),
+            100,
+            0,
+            deadline,
+            request_hash,
+        );
+
+        assert_eq!(result, Ok(true));
+
+        // Verify nonce incremented to 1
+        assert_eq!(Orchestrator::get_nonce(env, executor), 1);
+    }
+
+    #[test]
+    fn test_execute_flow_nonce_double_spend() {
+        let env = create_test_env();
+        let owner = TestAddress::random(&env);
+        let fw = TestAddress::random(&env);
+        let rs = TestAddress::random(&env);
+        let sg = TestAddress::random(&env);
+        let bp = TestAddress::random(&env);
+        let ins = TestAddress::random(&env);
+
+        let _init = Orchestrator::init(
+            env.clone(),
+            owner.clone(),
+            fw,
+            rs,
+            sg,
+            bp,
+            ins,
+        );
+
+        let executor = TestAddress::random(&env);
+        env.budget().reset_unlimited();
+
+        let now = env.ledger().timestamp();
+        let deadline = now + 1000;
+
+        let request_hash = Orchestrator::compute_request_hash(
+            symbol_short!("flow"),
+            executor.clone(),
+            0,
+            100,
+            deadline,
+        );
+
+        // First execution should succeed
+        let _result = Orchestrator::execute_remittance_flow(
+            env.clone(),
+            executor.clone(),
+            100,
+            0,
+            deadline,
+            request_hash,
+        );
+
+        // Now nonce is 1. Try to use nonce 0 again (already used)
+        let deadline2 = now + 2000;
+        let request_hash2 = Orchestrator::compute_request_hash(
+            symbol_short!("flow"),
+            executor.clone(),
+            0,
+            100,
+            deadline2,
+        );
+
+        let result2 = Orchestrator::execute_remittance_flow(
+            env,
+            executor,
+            100,
+            0, // Reusing nonce 0
+            deadline2,
+            request_hash2,
+        );
+
+        // Should fail: nonce already used
+        assert_eq!(result2, Err(OrchestratorError::NonceAlreadyUsed));
+    }
+
+    #[test]
+    fn test_get_execution_stats_initial() {
+        let env = create_test_env();
+        let owner = TestAddress::random(&env);
+        let fw = TestAddress::random(&env);
+        let rs = TestAddress::random(&env);
+        let sg = TestAddress::random(&env);
+        let bp = TestAddress::random(&env);
+        let ins = TestAddress::random(&env);
+
+        let _init = Orchestrator::init(
+            env.clone(),
+            owner.clone(),
+            fw,
+            rs,
+            sg,
+            bp,
+            ins,
+        );
+
+        let stats = Orchestrator::get_execution_stats(env);
         assert_eq!(
-            result.unwrap_err().unwrap(),
-            OrchestratorError::PermissionDenied
+            stats,
+            Some(ExecutionStats {
+                total_executions: 0,
+                successful_executions: 0,
+                failed_executions: 0,
+                last_execution_time: 0,
+            })
         );
     }
 
     #[test]
-    fn test_execute_bill_payment_succeeds() {
-        let (
-            env,
-            orchestrator_id,
-            family_wallet_id,
-            _remittance_split_id,
-            _savings_id,
-            bills_id,
-            _insurance_id,
-            user,
-        ) = setup_test_env();
+    fn test_get_audit_log_empty() {
+        let env = create_test_env();
+        let owner = TestAddress::random(&env);
+        let fw = TestAddress::random(&env);
+        let rs = TestAddress::random(&env);
+        let sg = TestAddress::random(&env);
+        let bp = TestAddress::random(&env);
+        let ins = TestAddress::random(&env);
 
-        let client = OrchestratorClient::new(&env, &orchestrator_id);
-
-        // Execute bill payment with amount within limit
-        let result = client.try_execute_bill_payment(
-            &user,
-            &3000,
-            &family_wallet_id,
-            &bills_id,
-            &1, // bill_id
+        let _init = Orchestrator::init(
+            env.clone(),
+            owner.clone(),
+            fw,
+            rs,
+            sg,
+            bp,
+            ins,
         );
 
-        // Should succeed
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_execute_bill_payment_invalid_bill_fails() {
-        let (
-            env,
-            orchestrator_id,
-            family_wallet_id,
-            _remittance_split_id,
-            _savings_id,
-            bills_id,
-            _insurance_id,
-            user,
-        ) = setup_test_env();
-
-        let client = OrchestratorClient::new(&env, &orchestrator_id);
-
-        // Execute bill payment with invalid bill_id (999)
-        // This should fail with BillPaymentFailed error
-        let result = client.try_execute_bill_payment(
-            &user,
-            &3000,
-            &family_wallet_id,
-            &bills_id,
-            &999, // invalid bill_id
-        );
-
-        // Should fail (the mock will panic, which gets caught and converted to error)
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_execute_insurance_payment_succeeds() {
-        let (
-            env,
-            orchestrator_id,
-            family_wallet_id,
-            _remittance_split_id,
-            _savings_id,
-            _bills_id,
-            insurance_id,
-            user,
-        ) = setup_test_env();
-
-        let client = OrchestratorClient::new(&env, &orchestrator_id);
-
-        // Execute insurance payment with amount within limit
-        let result = client.try_execute_insurance_payment(
-            &user,
-            &2000,
-            &family_wallet_id,
-            &insurance_id,
-            &1, // policy_id
-        );
-
-        // Should succeed
-        assert!(result.is_ok());
-    }
-
-    #[test]
-    fn test_execute_remittance_flow_succeeds() {
-        let (
-            env,
-            orchestrator_id,
-            family_wallet_id,
-            remittance_split_id,
-            savings_id,
-            bills_id,
-            insurance_id,
-            user,
-        ) = setup_test_env();
-
-        let client = OrchestratorClient::new(&env, &orchestrator_id);
-
-        // Execute complete remittance flow with amount within limit (10000)
-        let result = client.try_execute_remittance_flow(
-            &user,
-            &10000,
-            &family_wallet_id,
-            &remittance_split_id,
-            &savings_id,
-            &bills_id,
-            &insurance_id,
-            &1, // goal_id
-            &1, // bill_id
-            &1, // policy_id
-        );
-
-        // Should succeed
-        assert!(result.is_ok());
-
-        let flow_result = result.unwrap().unwrap();
-
-        // Verify allocations (40%, 30%, 20%, 10%)
-        assert_eq!(flow_result.total_amount, 10000);
-        assert_eq!(flow_result.spending_amount, 4000);
-        assert_eq!(flow_result.savings_amount, 3000);
-        assert_eq!(flow_result.bills_amount, 2000);
-        assert_eq!(flow_result.insurance_amount, 1000);
-
-        // Verify all operations succeeded
-        assert!(flow_result.savings_success);
-        assert!(flow_result.bills_success);
-        assert!(flow_result.insurance_success);
-    }
-
-    #[test]
-    fn test_execute_remittance_flow_bill_failure_rolls_back() {
-        let (
-            env,
-            orchestrator_id,
-            family_wallet_id,
-            remittance_split_id,
-            savings_id,
-            bills_id,
-            insurance_id,
-            user,
-        ) = setup_test_env();
-
-        let client = OrchestratorClient::new(&env, &orchestrator_id);
-
-        // Execute remittance flow with invalid bill_id (999)
-        // The mock will panic, but the orchestrator catches it and returns an error
-        let result = client.try_execute_remittance_flow(
-            &user,
-            &10000,
-            &family_wallet_id,
-            &remittance_split_id,
-            &savings_id,
-            &bills_id,
-            &insurance_id,
-            &1,   // valid goal_id
-            &999, // invalid bill_id - will cause failure
-            &1,   // valid policy_id
-        );
-
-        // Should fail (panic gets caught and converted to error)
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_execute_remittance_flow_savings_failure_rolls_back() {
-        let (
-            env,
-            orchestrator_id,
-            family_wallet_id,
-            remittance_split_id,
-            savings_id,
-            bills_id,
-            insurance_id,
-            user,
-        ) = setup_test_env();
-
-        let client = OrchestratorClient::new(&env, &orchestrator_id);
-
-        // Execute remittance flow with invalid goal_id (999)
-        // The mock will panic, but the orchestrator catches it and returns an error
-        let result = client.try_execute_remittance_flow(
-            &user,
-            &10000,
-            &family_wallet_id,
-            &remittance_split_id,
-            &savings_id,
-            &bills_id,
-            &insurance_id,
-            &999, // invalid goal_id - will cause failure
-            &1,   // valid bill_id
-            &1,   // valid policy_id
-        );
-
-        // Should fail (panic gets caught and converted to error)
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_execute_remittance_flow_spending_limit_exceeded_fails() {
-        let (
-            env,
-            orchestrator_id,
-            family_wallet_id,
-            remittance_split_id,
-            savings_id,
-            bills_id,
-            insurance_id,
-            user,
-        ) = setup_test_env();
-
-        let client = OrchestratorClient::new(&env, &orchestrator_id);
-
-        // Execute remittance flow with amount exceeding limit (15000 > 10000)
-        let result = client.try_execute_remittance_flow(
-            &user,
-            &15000,
-            &family_wallet_id,
-            &remittance_split_id,
-            &savings_id,
-            &bills_id,
-            &insurance_id,
-            &1, // goal_id
-            &1, // bill_id
-            &1, // policy_id
-        );
-
-        // Should fail - the mock returns false for amounts > 10000
-        // This gets interpreted as PermissionDenied (since check_spending_limit
-        // and check_family_wallet_permission use the same mock function)
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().unwrap(),
-            OrchestratorError::PermissionDenied
-        );
-    }
-
-    #[test]
-    fn test_execute_remittance_flow_invalid_amount_fails() {
-        let (
-            env,
-            orchestrator_id,
-            family_wallet_id,
-            remittance_split_id,
-            savings_id,
-            bills_id,
-            insurance_id,
-            user,
-        ) = setup_test_env();
-
-        let client = OrchestratorClient::new(&env, &orchestrator_id);
-
-        // Execute remittance flow with invalid amount (0)
-        let result = client.try_execute_remittance_flow(
-            &user,
-            &0, // invalid amount
-            &family_wallet_id,
-            &remittance_split_id,
-            &savings_id,
-            &bills_id,
-            &insurance_id,
-            &1, // goal_id
-            &1, // bill_id
-            &1, // policy_id
-        );
-
-        // Should fail with InvalidAmount
-        assert!(result.is_err());
-        assert_eq!(
-            result.unwrap_err().unwrap(),
-            OrchestratorError::InvalidAmount
-        );
-    }
-
-    #[test]
-    fn test_get_execution_stats_succeeds() {
-        let (env, orchestrator_id, _, _, _, _, _, _) = setup_test_env();
-
-        let client = OrchestratorClient::new(&env, &orchestrator_id);
-
-        // Get initial stats (should be all zeros)
-        let stats = client.get_execution_stats();
-
-        assert_eq!(stats.total_flows_executed, 0);
-        assert_eq!(stats.total_flows_failed, 0);
-        assert_eq!(stats.total_amount_processed, 0);
-        assert_eq!(stats.last_execution, 0);
-    }
-
-    #[test]
-    fn test_get_audit_log_succeeds() {
-        let (env, orchestrator_id, _, _, _, _, _, _) = setup_test_env();
-
-        let client = OrchestratorClient::new(&env, &orchestrator_id);
-
-        // Get audit log (should be empty initially)
-        let log = client.get_audit_log(&0, &10);
-
+        let log = Orchestrator::get_audit_log(env, 0, 20);
         assert_eq!(log.len(), 0);
+    }
+
+    #[test]
+    fn test_get_audit_log_pagination() {
+        let env = create_test_env();
+        let owner = TestAddress::random(&env);
+        let fw = TestAddress::random(&env);
+        let rs = TestAddress::random(&env);
+        let sg = TestAddress::random(&env);
+        let bp = TestAddress::random(&env);
+        let ins = TestAddress::random(&env);
+
+        let _init = Orchestrator::init(
+            env.clone(),
+            owner.clone(),
+            fw,
+            rs,
+            sg,
+            bp,
+            ins,
+        );
+
+        let executor = TestAddress::random(&env);
+        env.budget().reset_unlimited();
+
+        let now = env.ledger().timestamp();
+
+        // Execute multiple flows to generate audit entries
+        for i in 0..5 {
+            let deadline = now + 1000 + i * 100;
+            let request_hash = Orchestrator::compute_request_hash(
+                symbol_short!("flow"),
+                executor.clone(),
+                i,
+                100 + i as i128,
+                deadline,
+            );
+
+            let _result = Orchestrator::execute_remittance_flow(
+                env.clone(),
+                executor.clone(),
+                100 + i as i128,
+                i,
+                deadline,
+                request_hash,
+            );
+        }
+
+        // Get all audit entries
+        let log = Orchestrator::get_audit_log(env, 0, 50);
+        assert_eq!(log.len(), 5);
+    }
+
+    #[test]
+    fn test_get_version() {
+        let env = create_test_env();
+        let owner = TestAddress::random(&env);
+        let fw = TestAddress::random(&env);
+        let rs = TestAddress::random(&env);
+        let sg = TestAddress::random(&env);
+        let bp = TestAddress::random(&env);
+        let ins = TestAddress::random(&env);
+
+        let _init = Orchestrator::init(
+            env.clone(),
+            owner.clone(),
+            fw,
+            rs,
+            sg,
+            bp,
+            ins,
+        );
+
+        let version = Orchestrator::get_version(env);
+        assert_eq!(version, CONTRACT_VERSION);
+    }
+
+    #[test]
+    fn test_set_version_success() {
+        let env = create_test_env();
+        let owner = TestAddress::random(&env);
+        let fw = TestAddress::random(&env);
+        let rs = TestAddress::random(&env);
+        let sg = TestAddress::random(&env);
+        let bp = TestAddress::random(&env);
+        let ins = TestAddress::random(&env);
+
+        let _init = Orchestrator::init(
+            env.clone(),
+            owner.clone(),
+            fw,
+            rs,
+            sg,
+            bp,
+            ins,
+        );
+
+        env.budget().reset_unlimited();
+
+        let result = Orchestrator::set_version(env.clone(), owner, 2);
+        assert_eq!(result, Ok(true));
+
+        let new_version = Orchestrator::get_version(env);
+        assert_eq!(new_version, 2);
+    }
+
+    #[test]
+    fn test_set_version_unauthorized() {
+        let env = create_test_env();
+        let owner = TestAddress::random(&env);
+        let fw = TestAddress::random(&env);
+        let rs = TestAddress::random(&env);
+        let sg = TestAddress::random(&env);
+        let bp = TestAddress::random(&env);
+        let ins = TestAddress::random(&env);
+
+        let _init = Orchestrator::init(
+            env.clone(),
+            owner.clone(),
+            fw,
+            rs,
+            sg,
+            bp,
+            ins,
+        );
+
+        let non_owner = TestAddress::random(&env);
+        env.budget().reset_unlimited();
+
+        let result = Orchestrator::set_version(env, non_owner, 2);
+        assert_eq!(result, Err(OrchestratorError::Unauthorized));
+    }
+
+    #[test]
+    fn test_reentrancy_lock() {
+        let env = create_test_env();
+        let owner = TestAddress::random(&env);
+        let fw = TestAddress::random(&env);
+        let rs = TestAddress::random(&env);
+        let sg = TestAddress::random(&env);
+        let bp = TestAddress::random(&env);
+        let ins = TestAddress::random(&env);
+
+        let _init = Orchestrator::init(
+            env.clone(),
+            owner.clone(),
+            fw,
+            rs,
+            sg,
+            bp,
+            ins,
+        );
+
+        // Manually set execution lock (simulating reentrancy)
+        env.storage()
+            .instance()
+            .set(&symbol_short!("EXEC_LOCK"), &true);
+
+        let executor = TestAddress::random(&env);
+        env.budget().reset_unlimited();
+
+        let now = env.ledger().timestamp();
+        let deadline = now + 1000;
+        let request_hash = Orchestrator::compute_request_hash(
+            symbol_short!("flow"),
+            executor.clone(),
+            0,
+            100,
+            deadline,
+        );
+
+        let result = Orchestrator::execute_remittance_flow(
+            env,
+            executor,
+            100,
+            0,
+            deadline,
+            request_hash,
+        );
+
+        assert_eq!(result, Err(OrchestratorError::ExecutionLocked));
     }
 }

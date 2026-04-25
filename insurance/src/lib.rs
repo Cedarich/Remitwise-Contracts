@@ -1,160 +1,174 @@
 #![no_std]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+
+use remitwise_common::{CoverageType, EventCategory, EventPriority, RemitwiseEvents};
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Map, String,
     Symbol, Vec,
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, Env, Map, String, Symbol, Vec,
 };
 
-use remitwise_common::CoverageType;
+// Storage TTL constants
+const INSTANCE_LIFETIME_THRESHOLD: u32 = 17_280; // ~1 day
+const INSTANCE_BUMP_AMOUNT: u32 = 518_400; // ~30 days
+
+// Pagination constants
+pub const DEFAULT_PAGE_LIMIT: u32 = 20;
+pub const MAX_PAGE_LIMIT: u32 = 50;
+
+/// Maximum number of **active** policies a single owner may hold at one time.
+///
+/// Scope: active-only (deactivated and archived policies do not count toward
+/// this limit). This prevents unbounded storage growth and mitigates DoS via
+/// policy spam. The value matches `MAX_PAGE_LIMIT` so a single page always
+/// covers the full active set for any owner.
+pub const MAX_POLICIES_PER_OWNER: u32 = 50;
+
+// Storage keys
+const KEY_PAUSE_ADMIN: Symbol = symbol_short!("PAUSE_ADM");
+const KEY_NEXT_ID: Symbol = symbol_short!("NEXT_ID");
+const KEY_POLICIES: Symbol = symbol_short!("POLICIES");
+const KEY_OWNER_INDEX: Symbol = symbol_short!("OWN_IDX");
+const KEY_ARCHIVED: Symbol = symbol_short!("ARCH_POL");
+const KEY_STATS: Symbol = symbol_short!("STOR_STAT");
+
+// Per-owner active-policy counter map key
+const KEY_OWNER_ACTIVE: Symbol = symbol_short!("OWN_ACT");
+
+/// Errors returned by the Insurance contract.
 #[contracterror]
 #[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
 #[repr(u32)]
 pub enum InsuranceError {
+    /// Policy with the given ID does not exist.
     PolicyNotFound = 1,
+    /// Caller is not the policy owner.
     Unauthorized = 2,
-    InvalidAmount = 3,
-    PolicyInactive = 4,
-    ContractPaused = 5,
-    FunctionPaused = 6,
-    InvalidTimestamp = 7,
-    BatchTooLarge = 8,
+    /// Owner has reached `MAX_POLICIES_PER_OWNER` active policies.
+    PolicyLimitExceeded = 3,
 }
 
-// Event topics
-const POLICY_CREATED: Symbol = symbol_short!("created");
-const PREMIUM_PAID: Symbol = symbol_short!("paid");
-const POLICY_DEACTIVATED: Symbol = symbol_short!("deactive");
+// ---------------------------------------------------------------------------
+// Event topic symbols — locked; changing these is a breaking change for indexers
+// ---------------------------------------------------------------------------
 
-// Event data structures
+/// Topic action for PolicyCreated: (Remitwise, Transaction=0, Medium=1, "created")
+pub const EVT_POLICY_CREATED: Symbol = symbol_short!("created");
+/// Topic action for PremiumPaid: (Remitwise, Transaction=0, Low=0, "paid")
+pub const EVT_PREMIUM_PAID: Symbol = symbol_short!("paid");
+/// Topic action for PolicyDeactivated: (Remitwise, State=1, Medium=1, "deactive")
+pub const EVT_POLICY_DEACTIVATED: Symbol = symbol_short!("deactive");
+/// Topic action for ExternalRefUpdated: (Remitwise, State=1, Low=0, "ext_ref")
+pub const EVT_EXT_REF_UPDATED: Symbol = symbol_short!("ext_ref");
+
+// ---------------------------------------------------------------------------
+// Event payload structs
+// ---------------------------------------------------------------------------
+
+/// Payload emitted when a new insurance policy is created.
+///
+/// Topics: `("Remitwise", Transaction=0, Medium=1, "created")`
 #[derive(Clone)]
 #[contracttype]
 pub struct PolicyCreatedEvent {
     pub policy_id: u32,
-    pub name: String,
+    pub owner: Address,
     pub coverage_type: CoverageType,
     pub monthly_premium: i128,
     pub coverage_amount: i128,
     pub timestamp: u64,
 }
 
+/// Payload emitted when a premium payment is recorded.
+///
+/// Topics: `("Remitwise", Transaction=0, Low=0, "paid")`
 #[derive(Clone)]
 #[contracttype]
 pub struct PremiumPaidEvent {
     pub policy_id: u32,
-    pub name: String,
+    pub owner: Address,
     pub amount: i128,
     pub next_payment_date: u64,
     pub timestamp: u64,
 }
 
+/// Payload emitted when a policy is deactivated.
+///
+/// Topics: `("Remitwise", State=1, Medium=1, "deactive")`
 #[derive(Clone)]
 #[contracttype]
 pub struct PolicyDeactivatedEvent {
     pub policy_id: u32,
-    pub name: String,
+    pub owner: Address,
     pub timestamp: u64,
 }
 
-// Storage TTL constants
-const INSTANCE_LIFETIME_THRESHOLD: u32 = 17280; // ~1 day
-const INSTANCE_BUMP_AMOUNT: u32 = 518400; // ~30 days
-
-const CONTRACT_VERSION: u32 = 1;
-const MAX_BATCH_SIZE: u32 = 50;
-const STORAGE_PREMIUM_TOTALS: Symbol = symbol_short!("PRM_TOT");
-
-/// Pagination constants
-pub const DEFAULT_PAGE_LIMIT: u32 = 20;
-pub const MAX_PAGE_LIMIT: u32 = 50;
-
-pub mod pause_functions {
-    use soroban_sdk::{symbol_short, Symbol};
-    pub const CREATE_POLICY: Symbol = symbol_short!("crt_pol");
-    pub const PAY_PREMIUM: Symbol = symbol_short!("pay_prem");
-    pub const DEACTIVATE: Symbol = symbol_short!("deact");
-    pub const CREATE_SCHED: Symbol = symbol_short!("crt_sch");
-    pub const MODIFY_SCHED: Symbol = symbol_short!("mod_sch");
-    pub const CANCEL_SCHED: Symbol = symbol_short!("can_sch");
+/// Payload emitted when a policy's external reference is updated or cleared.
+///
+/// Topics: `("Remitwise", State=1, Low=0, "ext_ref")`
+#[derive(Clone)]
+#[contracttype]
+pub struct ExternalRefUpdatedEvent {
+    pub policy_id: u32,
+    pub owner: Address,
+    pub external_ref: Option<String>,
+    pub timestamp: u64,
 }
 
-/// Insurance policy data structure with owner tracking for access control
-#[derive(Clone)]
+// ---------------------------------------------------------------------------
+// Core data types
+// ---------------------------------------------------------------------------
+
 #[contracttype]
 #[derive(Clone)]
-#[contracttype]
-#[derive(Clone)]
-#[contracttype]
 pub struct InsurancePolicy {
     pub id: u32,
     pub owner: Address,
     pub name: String,
     pub external_ref: Option<String>,
-    pub coverage_type: String,
     pub coverage_type: CoverageType,
     pub monthly_premium: i128,
     pub coverage_amount: i128,
     pub active: bool,
     pub next_payment_date: u64,
-    pub schedule_id: Option<u32>,
-    pub tags: Vec<String>,
 }
 
+/// Compact record stored in the archive after a policy is deactivated and
+/// explicitly archived via `archive_policies`.
+#[contracttype]
+#[derive(Clone)]
+pub struct ArchivedPolicy {
+    pub id: u32,
+    pub owner: Address,
+    pub name: String,
+    pub coverage_type: CoverageType,
+    pub monthly_premium: i128,
+    pub coverage_amount: i128,
+    pub archived_at: u64,
+}
 
-/// Paginated result for insurance policy queries
 #[contracttype]
 #[derive(Clone)]
 pub struct PolicyPage {
-    /// Policies for this page
     pub items: Vec<InsurancePolicy>,
-    /// Pass as `cursor` for the next page. 0 = no more pages.
     pub next_cursor: u32,
-    /// Number of items returned
     pub count: u32,
 }
 
-/// Schedule for automatic premium payments
+/// Snapshot of contract storage usage.
+///
+/// Counters are updated deterministically on every lifecycle transition:
+/// - `create_policy`   → `active_policies` +1
+/// - `deactivate_policy` → `active_policies` -1
+/// - `archive_policies`  → `archived_policies` +N, `active_policies` unchanged
+///   (deactivated policies are already excluded from the active count)
+/// - `restore_policy`    → `archived_policies` -1, `active_policies` +1
+/// - `cleanup_policies`  → `archived_policies` -N
 #[contracttype]
 #[derive(Clone)]
-pub struct PremiumSchedule {
-    pub id: u32,
-    pub owner: Address,
-    pub policy_id: u32,
-    pub next_due: u64,
-    pub interval: u64,
-    pub recurring: bool,
-    pub active: bool,
-    pub created_at: u64,
-    pub last_executed: Option<u64>,
-    pub missed_count: u32,
-}
-
-#[contracterror]
-#[derive(Copy, Clone, Debug, Eq, PartialEq, PartialOrd, Ord)]
-#[repr(u32)]
-pub enum InsuranceError {
-    InvalidPremium = 1,
-    InvalidCoverage = 2,
-    PolicyNotFound = 3,
-    PolicyInactive = 4,
-    Unauthorized = 5,
-    BatchTooLarge = 6,
-}
-
-
-
-#[contracttype]
-#[derive(Clone)]
-pub enum InsuranceEvent {
-    PolicyCreated,
-    PremiumPaid,
-    PolicyDeactivated,
-    ExternalRefUpdated,
-    ScheduleCreated,
-    ScheduleExecuted,
-    ScheduleMissed,
-    ScheduleModified,
-    ScheduleCancelled,
+pub struct StorageStats {
+    pub active_policies: u32,
+    pub archived_policies: u32,
+    pub last_updated: u64,
 }
 
 #[contract]
@@ -162,26 +176,15 @@ pub struct Insurance;
 
 #[contractimpl]
 impl Insurance {
-    /// Create a new insurance policy
-    ///
-    /// # Arguments
-    /// * `owner` - Address of the policy owner (must authorize)
-    /// * `name` - Name of the policy
-    /// * `coverage_type` - Type of coverage (e.g., "health", "emergency")
-    /// * `monthly_premium` - Monthly premium amount (must be positive)
-    /// * `coverage_amount` - Total coverage amount (must be positive)
-    /// * `external_ref` - Optional external system reference ID
-    ///
-    /// # Returns
-    /// The ID of the created policy
-    ///
-    /// # Panics
-    /// - If owner doesn't authorize the transaction
-    /// - If monthly_premium is not positive
-    /// - If coverage_amount is not positive
     // -----------------------------------------------------------------------
     // Internal helpers
     // -----------------------------------------------------------------------
+
+    fn extend_instance_ttl(env: &Env) {
+        env.storage()
+            .instance()
+            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
+    }
 
     fn clamp_limit(limit: u32) -> u32 {
         if limit == 0 {
@@ -193,511 +196,69 @@ impl Insurance {
         }
     }
 
-    fn get_pause_admin(env: &Env) -> Option<Address> {
-        env.storage().instance().get(&symbol_short!("PAUSE_ADM"))
-    }
-    fn get_global_paused(env: &Env) -> bool {
+    /// Read the current `StorageStats`, defaulting to zeroes if not yet written.
+    fn read_stats(env: &Env) -> StorageStats {
         env.storage()
             .instance()
-            .get(&symbol_short!("PAUSED"))
-            .unwrap_or(false)
-    }
-    fn is_function_paused(env: &Env, func: Symbol) -> bool {
-        env.storage()
-            .instance()
-            .get::<_, Map<Symbol, bool>>(&symbol_short!("PAUSED_FN"))
-            .unwrap_or_else(|| Map::new(env))
-            .get(func)
-            .unwrap_or(false)
-    }
-    fn require_not_paused(env: &Env, func: Symbol) -> Result<(), InsuranceError> {
-        if Self::get_global_paused(env) {
-            return Err(InsuranceError::ContractPaused);
-        }
-        if Self::is_function_paused(env, func) {
-            return Err(InsuranceError::FunctionPaused);
-        }
-        Ok(())
+            .get(&KEY_STATS)
+            .unwrap_or(StorageStats {
+                active_policies: 0,
+                archived_policies: 0,
+                last_updated: 0,
+            })
     }
 
-    pub fn set_pause_admin(
-        env: Env,
-        caller: Address,
-        new_admin: Address,
-    ) -> Result<(), InsuranceError> {
-        caller.require_auth();
-        let current = Self::get_pause_admin(&env);
-        match current {
-            None => {
-                if caller != new_admin {
-                    return Err(InsuranceError::Unauthorized);
-                }
-            }
-            Some(admin) if admin != caller => return Err(InsuranceError::Unauthorized),
-            _ => {}
-        }
-        env.storage()
-            .instance()
-            .set(&symbol_short!("PAUSE_ADM"), &new_admin);
-        Ok(())
+    fn write_stats(env: &Env, stats: StorageStats) {
+        env.storage().instance().set(&KEY_STATS, &stats);
     }
-    pub fn pause(env: Env, caller: Address) -> Result<(), InsuranceError> {
-        caller.require_auth();
-        let admin = Self::get_pause_admin(&env).unwrap_or_else(|| panic!("No pause admin set"));
-        let admin = Self::get_pause_admin(&env).ok_or(InsuranceError::Unauthorized)?;
-        if admin != caller {
-            return Err(InsuranceError::Unauthorized);
-        }
-        env.storage()
-            .instance()
-            .set(&symbol_short!("PAUSED"), &true);
-        env.events()
-            .publish((symbol_short!("insure"), symbol_short!("paused")), ());
-        Ok(())
-    }
-    pub fn unpause(env: Env, caller: Address) -> Result<(), InsuranceError> {
-        caller.require_auth();
-        let admin = Self::get_pause_admin(&env).unwrap_or_else(|| panic!("No pause admin set"));
-        let admin = Self::get_pause_admin(&env).ok_or(InsuranceError::Unauthorized)?;
-        if admin != caller {
-            return Err(InsuranceError::Unauthorized);
-        }
-        let unpause_at: Option<u64> = env.storage().instance().get(&symbol_short!("UNP_AT"));
-        if let Some(at) = unpause_at {
-            if env.ledger().timestamp() < at {
-                panic!("Time-locked unpause not yet reached");
-            }
-            env.storage().instance().remove(&symbol_short!("UNP_AT"));
-        }
-        env.storage()
-            .instance()
-            .set(&symbol_short!("PAUSED"), &false);
-        env.events()
-            .publish((symbol_short!("insure"), symbol_short!("unpaused")), ());
-        Ok(())
-    }
-    pub fn pause_function(env: Env, caller: Address, func: Symbol) -> Result<(), InsuranceError> {
-        caller.require_auth();
-        let admin = Self::get_pause_admin(&env).unwrap_or_else(|| panic!("No pause admin set"));
-        if admin != caller {
-            return Err(InsuranceError::Unauthorized);
-        }
-        let mut m: Map<Symbol, bool> = env
+
+    /// Return the number of active policies for `owner`.
+    fn owner_active_count(env: &Env, owner: &Address) -> u32 {
+        let counts: Map<Address, u32> = env
             .storage()
             .instance()
-            .get(&symbol_short!("PAUSED_FN"))
-            .unwrap_or_else(|| Map::new(&env));
-        m.set(func, true);
-        env.storage()
-            .instance()
-            .set(&symbol_short!("PAUSED_FN"), &m);
-        Ok(())
+            .get(&KEY_OWNER_ACTIVE)
+            .unwrap_or_else(|| Map::new(env));
+        counts.get(owner.clone()).unwrap_or(0)
     }
-    pub fn unpause_function(env: Env, caller: Address, func: Symbol) -> Result<(), InsuranceError> {
-        caller.require_auth();
-        let admin = Self::get_pause_admin(&env).unwrap_or_else(|| panic!("No pause admin set"));
-        if admin != caller {
-            return Err(InsuranceError::Unauthorized);
-        }
-        let mut m: Map<Symbol, bool> = env
+
+    /// Adjust the per-owner active-policy counter by `delta` (+1 or -1).
+    fn adjust_owner_active(env: &Env, owner: &Address, delta: i32) {
+        let mut counts: Map<Address, u32> = env
             .storage()
             .instance()
-            .get(&symbol_short!("PAUSED_FN"))
-            .unwrap_or_else(|| Map::new(&env));
-        m.set(func, false);
-        env.storage()
-            .instance()
-            .set(&symbol_short!("PAUSED_FN"), &m);
-        Ok(())
-    }
-    pub fn emergency_pause_all(env: Env, caller: Address) {
-        let _ = Self::pause(env.clone(), caller.clone());
-        for func in [
-            pause_functions::CREATE_POLICY,
-            pause_functions::PAY_PREMIUM,
-            pause_functions::DEACTIVATE,
-            pause_functions::CREATE_SCHED,
-            pause_functions::MODIFY_SCHED,
-            pause_functions::CANCEL_SCHED,
-        ] {
-            let _ = Self::pause_function(env.clone(), caller.clone(), func);
-        }
-    }
-    pub fn is_paused(env: Env) -> bool {
-        Self::get_global_paused(&env)
-    }
-    pub fn get_version(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&symbol_short!("VERSION"))
-            .unwrap_or(CONTRACT_VERSION)
-    }
-    fn get_upgrade_admin(env: &Env) -> Option<Address> {
-        env.storage().instance().get(&symbol_short!("UPG_ADM"))
-    }
-    pub fn set_upgrade_admin(
-        env: Env,
-        caller: Address,
-        new_admin: Address,
-    ) -> Result<(), InsuranceError> {
-        caller.require_auth();
-        let current = Self::get_upgrade_admin(&env);
-        match current {
-            None => {
-                if caller != new_admin {
-                    return Err(InsuranceError::Unauthorized);
-                }
-            }
-            Some(adm) if adm != caller => return Err(InsuranceError::Unauthorized),
-            _ => {}
-        }
-        env.storage()
-            .instance()
-            .set(&symbol_short!("UPG_ADM"), &new_admin);
-        Ok(())
-    }
-    pub fn set_version(env: Env, caller: Address, new_version: u32) -> Result<(), InsuranceError> {
-        caller.require_auth();
-        let admin = match Self::get_upgrade_admin(&env) {
-            Some(a) => a,
-            None => panic!("No upgrade admin set"),
+            .get(&KEY_OWNER_ACTIVE)
+            .unwrap_or_else(|| Map::new(env));
+        let current = counts.get(owner.clone()).unwrap_or(0);
+        let next = if delta >= 0 {
+            current.saturating_add(delta as u32)
+        } else {
+            current.saturating_sub((-delta) as u32)
         };
-        if admin != caller {
-            return Err(InsuranceError::Unauthorized);
-        }
-        let prev = Self::get_version(env.clone());
-        env.storage()
-            .instance()
-            .set(&symbol_short!("VERSION"), &new_version);
-        env.events().publish(
-            (symbol_short!("insure"), symbol_short!("upgraded")),
-            (prev, new_version),
-        );
-        Ok(())
+        counts.set(owner.clone(), next);
+        env.storage().instance().set(&KEY_OWNER_ACTIVE, &counts);
     }
 
     // -----------------------------------------------------------------------
-    // Tag management
+    // Admin
     // -----------------------------------------------------------------------
 
-    fn validate_tags(tags: &Vec<String>) {
-        if tags.is_empty() {
-            panic!("Tags cannot be empty");
-        }
-        for tag in tags.iter() {
-            if tag.len() == 0 || tag.len() > 32 {
-                panic!("Tag must be between 1 and 32 characters");
-            }
-        }
-    }
-
-    pub fn add_tags_to_policy(
-        env: Env,
-        caller: Address,
-        policy_id: u32,
-        tags: Vec<String>,
-    ) {
+    pub fn set_pause_admin(env: Env, caller: Address, new_admin: Address) -> bool {
         caller.require_auth();
-        Self::validate_tags(&tags);
         Self::extend_instance_ttl(&env);
-
-        let mut policies: Map<u32, InsurancePolicy> = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("POLICIES"))
-            .unwrap_or_else(|| Map::new(&env));
-
-        let mut policy = policies.get(policy_id).expect("Policy not found");
-
-        if policy.owner != caller {
-            panic!("Only the policy owner can add tags");
-        }
-
-        for tag in tags.iter() {
-            policy.tags.push_back(tag);
-        }
-
-        policies.set(policy_id, policy);
-        env.storage()
-            .instance()
-            .set(&symbol_short!("POLICIES"), &policies);
-
-        env.events().publish(
-            (symbol_short!("insure"), symbol_short!("tags_add")),
-            (policy_id, caller, tags),
-        );
-    }
-
-    pub fn remove_tags_from_policy(
-        env: Env,
-        caller: Address,
-        policy_id: u32,
-        tags: Vec<String>,
-    ) {
-        caller.require_auth();
-        Self::validate_tags(&tags);
-        Self::extend_instance_ttl(&env);
-
-        let mut policies: Map<u32, InsurancePolicy> = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("POLICIES"))
-            .unwrap_or_else(|| Map::new(&env));
-
-        let mut policy = policies.get(policy_id).expect("Policy not found");
-
-        if policy.owner != caller {
-            panic!("Only the policy owner can remove tags");
-        }
-
-        let mut new_tags = Vec::new(&env);
-        for existing_tag in policy.tags.iter() {
-            let mut should_keep = true;
-            for remove_tag in tags.iter() {
-                if existing_tag == remove_tag {
-                    should_keep = false;
-                    break;
-                }
-            }
-            if should_keep {
-                new_tags.push_back(existing_tag);
-            }
-        }
-
-        policy.tags = new_tags;
-        policies.set(policy_id, policy);
-        env.storage()
-            .instance()
-            .set(&symbol_short!("POLICIES"), &policies);
-
-        env.events().publish(
-            (symbol_short!("insure"), symbol_short!("tags_rem")),
-            (policy_id, caller, tags),
-        );
+        env.storage().instance().set(&KEY_PAUSE_ADMIN, &new_admin);
+        true
     }
 
     // -----------------------------------------------------------------------
-    // Tag management
+    // Core policy lifecycle
     // -----------------------------------------------------------------------
 
-    fn validate_tags(tags: &Vec<String>) {
-        if tags.is_empty() {
-            panic!("Tags cannot be empty");
-        }
-        for tag in tags.iter() {
-            if tag.len() == 0 || tag.len() > 32 {
-                panic!("Tag must be between 1 and 32 characters");
-            }
-        }
-    }
-
-    pub fn add_tags_to_policy(
-        env: Env,
-        caller: Address,
-        policy_id: u32,
-        tags: Vec<String>,
-    ) {
-        caller.require_auth();
-        Self::validate_tags(&tags);
-        Self::extend_instance_ttl(&env);
-
-        let mut policies: Map<u32, InsurancePolicy> = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("POLICIES"))
-            .unwrap_or_else(|| Map::new(&env));
-
-        let mut policy = policies.get(policy_id).expect("Policy not found");
-
-        if policy.owner != caller {
-            panic!("Only the policy owner can add tags");
-        }
-
-        for tag in tags.iter() {
-            policy.tags.push_back(tag);
-        }
-
-        policies.set(policy_id, policy);
-        env.storage()
-            .instance()
-            .set(&symbol_short!("POLICIES"), &policies);
-
-        env.events().publish(
-            (symbol_short!("insure"), symbol_short!("tags_add")),
-            (policy_id, caller, tags),
-        );
-    }
-
-    pub fn remove_tags_from_policy(
-        env: Env,
-        caller: Address,
-        policy_id: u32,
-        tags: Vec<String>,
-    ) {
-        caller.require_auth();
-        Self::validate_tags(&tags);
-        Self::extend_instance_ttl(&env);
-
-        let mut policies: Map<u32, InsurancePolicy> = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("POLICIES"))
-            .unwrap_or_else(|| Map::new(&env));
-
-        let mut policy = policies.get(policy_id).expect("Policy not found");
-
-        if policy.owner != caller {
-            panic!("Only the policy owner can remove tags");
-        }
-
-        let mut new_tags = Vec::new(&env);
-        for existing_tag in policy.tags.iter() {
-            let mut should_keep = true;
-            for remove_tag in tags.iter() {
-                if existing_tag == remove_tag {
-                    should_keep = false;
-                    break;
-                }
-            }
-            if should_keep {
-                new_tags.push_back(existing_tag);
-            }
-        }
-
-        policy.tags = new_tags;
-        policies.set(policy_id, policy);
-        env.storage()
-            .instance()
-            .set(&symbol_short!("POLICIES"), &policies);
-
-        env.events().publish(
-            (symbol_short!("insure"), symbol_short!("tags_rem")),
-            (policy_id, caller, tags),
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Tag management
-    // -----------------------------------------------------------------------
-
-    fn validate_tags(tags: &Vec<String>) {
-        if tags.is_empty() {
-            panic!("Tags cannot be empty");
-        }
-        for tag in tags.iter() {
-            if tag.len() == 0 || tag.len() > 32 {
-                panic!("Tag must be between 1 and 32 characters");
-            }
-        }
-    }
-
-    pub fn add_tags_to_policy(
-        env: Env,
-        caller: Address,
-        policy_id: u32,
-        tags: Vec<String>,
-    ) {
-        caller.require_auth();
-        Self::validate_tags(&tags);
-        Self::extend_instance_ttl(&env);
-
-        let mut policies: Map<u32, InsurancePolicy> = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("POLICIES"))
-            .unwrap_or_else(|| Map::new(&env));
-
-        let mut policy = policies.get(policy_id).expect("Policy not found");
-
-        if policy.owner != caller {
-            panic!("Only the policy owner can add tags");
-        }
-
-        for tag in tags.iter() {
-            policy.tags.push_back(tag);
-        }
-
-        policies.set(policy_id, policy);
-        env.storage()
-            .instance()
-            .set(&symbol_short!("POLICIES"), &policies);
-
-        env.events().publish(
-            (symbol_short!("insure"), symbol_short!("tags_add")),
-            (policy_id, caller, tags),
-        );
-    }
-
-    pub fn remove_tags_from_policy(
-        env: Env,
-        caller: Address,
-        policy_id: u32,
-        tags: Vec<String>,
-    ) {
-        caller.require_auth();
-        Self::validate_tags(&tags);
-        Self::extend_instance_ttl(&env);
-
-        let mut policies: Map<u32, InsurancePolicy> = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("POLICIES"))
-            .unwrap_or_else(|| Map::new(&env));
-
-        let mut policy = policies.get(policy_id).expect("Policy not found");
-
-        if policy.owner != caller {
-            panic!("Only the policy owner can remove tags");
-        }
-
-        let mut new_tags = Vec::new(&env);
-        for existing_tag in policy.tags.iter() {
-            let mut should_keep = true;
-            for remove_tag in tags.iter() {
-                if existing_tag == remove_tag {
-                    should_keep = false;
-                    break;
-                }
-            }
-            if should_keep {
-                new_tags.push_back(existing_tag);
-            }
-        }
-
-        policy.tags = new_tags;
-        policies.set(policy_id, policy);
-        env.storage()
-            .instance()
-            .set(&symbol_short!("POLICIES"), &policies);
-
-        env.events().publish(
-            (symbol_short!("insure"), symbol_short!("tags_rem")),
-            (policy_id, caller, tags),
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Core policy operations (unchanged)
-    // -----------------------------------------------------------------------
-
-    /// Creates a new insurance policy for the owner.
-    ///
-    /// # Arguments
-    /// * `owner` - Address of the policy owner (must authorize)
-    /// * `name` - Policy name (e.g., "Life Insurance")
-    /// * `coverage_type` - Type of coverage (e.g., "Term", "Whole")
-    /// * `monthly_premium` - Monthly premium amount in stroops (must be > 0)
-    /// * `coverage_amount` - Total coverage amount in stroops (must be > 0)
-    ///
-    /// # Returns
-    /// `Ok(policy_id)` - The newly created policy ID
+    /// Create a new insurance policy for `owner`.
     ///
     /// # Errors
-    /// * `InvalidAmount` - If monthly_premium ≤ 0 or coverage_amount ≤ 0
-    ///
-    /// # Panics
-    /// * If `owner` does not authorize the transaction (implicit via `require_auth()`)
-    /// * If the contract is globally or function-specifically paused
+    /// - `PolicyLimitExceeded` if the owner already holds `MAX_POLICIES_PER_OWNER`
+    ///   active policies.
     pub fn create_policy(
         env: Env,
         owner: Address,
@@ -706,357 +267,114 @@ impl Insurance {
         monthly_premium: i128,
         coverage_amount: i128,
         external_ref: Option<String>,
-    ) -> u32 {
     ) -> Result<u32, InsuranceError> {
         owner.require_auth();
-        Self::require_not_paused(&env, pause_functions::CREATE_POLICY)?;
+        Self::extend_instance_ttl(&env);
 
-        if monthly_premium <= 0 || coverage_amount <= 0 {
-            return Err(InsuranceError::InvalidAmount);
+        // Enforce per-owner active-policy cap.
+        let active_count = Self::owner_active_count(&env, &owner);
+        if active_count >= MAX_POLICIES_PER_OWNER {
+            return Err(InsuranceError::PolicyLimitExceeded);
         }
 
-        Self::extend_instance_ttl(&env);
+        let mut next_id: u32 = env.storage().instance().get(&KEY_NEXT_ID).unwrap_or(0);
+        next_id += 1;
 
         let mut policies: Map<u32, InsurancePolicy> = env
             .storage()
             .instance()
-            .get(&symbol_short!("POLICIES"))
+            .get(&KEY_POLICIES)
             .unwrap_or_else(|| Map::new(&env));
-
-        let next_id = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("NEXT_ID"))
-            .unwrap_or(0u32)
-            + 1;
-
-        let next_payment_date = env.ledger().timestamp() + (30 * 86400);
 
         let policy = InsurancePolicy {
             id: next_id,
             owner: owner.clone(),
-            name: name.clone(),
-            external_ref,
-            coverage_type: coverage_type.clone(),
+            name,
+            external_ref: external_ref.clone(),
+            coverage_type,
             monthly_premium,
             coverage_amount,
             active: true,
-            next_payment_date,
-            schedule_id: None,
-            tags: Vec::new(&env),
+            next_payment_date: env.ledger().timestamp() + (30 * 86_400),
         };
-
-        let policy_owner = policy.owner.clone();
-        let policy_external_ref = policy.external_ref.clone();
         policies.set(next_id, policy);
-        env.storage()
-            .instance()
-            .set(&symbol_short!("POLICIES"), &policies);
-        env.storage()
-            .instance()
-            .set(&symbol_short!("NEXT_ID"), &next_id);
-        Self::adjust_active_premium_total(&env, &owner, monthly_premium);
+        env.storage().instance().set(&KEY_POLICIES, &policies);
 
-        env.events().publish(
-            (POLICY_CREATED,),
-            PolicyCreatedEvent {
-                policy_id: next_id,
-                name,
-                coverage_type,
-                monthly_premium,
-                coverage_amount,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
+        // Update owner index.
+        let mut index: Map<Address, Vec<u32>> = env
+            .storage()
+            .instance()
+            .get(&KEY_OWNER_INDEX)
+            .unwrap_or_else(|| Map::new(&env));
+        let mut ids = index.get(owner.clone()).unwrap_or_else(|| Vec::new(&env));
+        ids.push_back(next_id);
+        index.set(owner.clone(), ids);
+        env.storage().instance().set(&KEY_OWNER_INDEX, &index);
 
-        env.events().publish(
-            (symbol_short!("insure"), InsuranceEvent::PolicyCreated),
-            (next_id, policy_owner, policy_external_ref),
-            (next_id, owner),
-        );
+        env.storage().instance().set(&KEY_NEXT_ID, &next_id);
+
+        // Update counters.
+        Self::adjust_owner_active(&env, &owner, 1);
+        let mut stats = Self::read_stats(&env);
+        stats.active_policies = stats.active_policies.saturating_add(1);
+        stats.last_updated = env.ledger().timestamp();
+        Self::write_stats(&env, stats);
 
         Ok(next_id)
     }
 
-    /// Pays a premium for a specific policy.
-    ///
-    /// # Arguments
-    /// * `caller` - Address of the policy owner (must authorize)
-    /// * `policy_id` - ID of the policy to pay premium for
-    ///
-    /// # Returns
-    /// `Ok(())` on successful premium payment
-    ///
-    /// # Errors
-    /// * `PolicyNotFound` - If policy_id does not exist
-    /// * `Unauthorized` - If caller is not the policy owner
-    /// * `PolicyInactive` - If the policy is not active
-    ///
-    /// # Panics
-    /// * If `caller` does not authorize the transaction
-    pub fn pay_premium(env: Env, caller: Address, policy_id: u32) -> Result<(), InsuranceError> {
-        caller.require_auth();
-        Self::require_not_paused(&env, pause_functions::PAY_PREMIUM)?;
-        Self::extend_instance_ttl(&env);
-
-        let mut policies: Map<u32, InsurancePolicy> = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("POLICIES"))
-            .unwrap_or_else(|| Map::new(&env));
-
-        let mut policy = match policies.get(policy_id) {
-            Some(p) => p,
-            None => return Err(InsuranceError::PolicyNotFound),
-        };
-
-        if policy.owner != caller {
-            return Err(InsuranceError::Unauthorized);
-        }
-        if !policy.active {
-            return Err(InsuranceError::PolicyInactive);
-        }
-
-        policy.next_payment_date = env.ledger().timestamp() + (30 * 86400);
-
-        let policy_external_ref = policy.external_ref.clone();
-        let event = PremiumPaidEvent {
-            policy_id,
-            name: policy.name.clone(),
-            amount: policy.monthly_premium,
-            next_payment_date: policy.next_payment_date,
-            timestamp: env.ledger().timestamp(),
-        };
-        env.events().publish((PREMIUM_PAID,), event);
-
-        policies.set(policy_id, policy);
-        policies.set(policy_id, policy.clone());
-        env.storage()
-            .instance()
-            .set(&symbol_short!("POLICIES"), &policies);
-
-        env.events().publish(
-            (PREMIUM_PAID,),
-            PremiumPaidEvent {
-                policy_id,
-                name: policy.name,
-                amount: policy.monthly_premium,
-                next_payment_date: policy.next_payment_date,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
-
-        env.events().publish(
-            (symbol_short!("insure"), InsuranceEvent::PremiumPaid),
-            (policy_id, caller, policy_external_ref),
-        );
-
-        Ok(())
-    }
-
-    pub fn batch_pay_premiums(
-        env: Env,
-        caller: Address,
-        policy_ids: Vec<u32>,
-    ) -> Result<u32, InsuranceError> {
-        caller.require_auth();
-        Self::require_not_paused(&env, pause_functions::PAY_PREMIUM)?;
-        if policy_ids.len() > MAX_BATCH_SIZE {
-            return Err(InsuranceError::BatchTooLarge);
-        }
-        let mut policies_map: Map<u32, InsurancePolicy> = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("POLICIES"))
-            .unwrap_or_else(|| Map::new(&env));
-        for id in policy_ids.iter() {
-            let policy = match policies_map.get(id) {
-                Some(p) => p,
-                None => return Err(InsuranceError::PolicyNotFound),
-            };
-            if policy.owner != caller {
-                return Err(InsuranceError::Unauthorized);
-            }
-            if !policy.active {
-                return Err(InsuranceError::PolicyInactive);
-            }
-        }
-
-        let current_time = env.ledger().timestamp();
-        let mut paid_count = 0;
-        for id in policy_ids.iter() {
-            let mut policy = policies.get(id).unwrap_or_else(|| panic!("Policy not found"));
-            let mut policy = policies_map.get(id).unwrap();
-            policy.next_payment_date = current_time + (30 * 86400);
-            let event = PremiumPaidEvent {
-                policy_id: id,
-                name: policy.name.clone(),
-                amount: policy.monthly_premium,
-                next_payment_date: policy.next_payment_date,
-                timestamp: current_time,
-            };
-            env.events().publish((PREMIUM_PAID,), event);
-            env.events().publish(
-                (symbol_short!("insure"), InsuranceEvent::PremiumPaid),
-                (id, caller.clone()),
-            );
-            policies_map.set(id, policy);
-            paid_count += 1;
-        }
-        env.storage()
-            .instance()
-            .set(&symbol_short!("POLICIES"), &policies_map);
-        env.events().publish(
-            (symbol_short!("insure"), symbol_short!("batch_pay")),
-            (paid_count, caller),
-        );
-        Ok(paid_count)
-    }
-
-    /// Get a policy by ID
-    ///
-    /// # Arguments
-    /// * `policy_id` - ID of the policy
-    ///
-    /// # Returns
-    /// InsurancePolicy struct or None if not found
     pub fn get_policy(env: Env, policy_id: u32) -> Option<InsurancePolicy> {
+        Self::extend_instance_ttl(&env);
         let policies: Map<u32, InsurancePolicy> = env
             .storage()
             .instance()
-            .get(&symbol_short!("POLICIES"))
+            .get(&KEY_POLICIES)
             .unwrap_or_else(|| Map::new(&env));
-
         policies.get(policy_id)
     }
 
-    /// Get all active policies for a specific owner
+    /// Deactivate a policy owned by `caller`.
     ///
-    /// # Arguments
-    /// * `owner` - Address of the policy owner
-    ///
-    /// # Returns
-    /// Vec of active InsurancePolicy structs belonging to the owner
-    pub fn get_active_policies(env: Env, owner: Address) -> Vec<InsurancePolicy> {
-        let policies: Map<u32, InsurancePolicy> = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("POLICIES"))
-            .unwrap_or_else(|| Map::new(&env));
-
-        let mut result = Vec::new(&env);
-        for (_, policy) in policies.iter() {
-            if policy.active && policy.owner == owner {
-                result.push_back(policy);
-            }
-        }
-        result
-    }
-
-    /// Get total monthly premium for all active policies of an owner
-    ///
-    /// # Arguments
-    /// * `owner` - Address of the policy owner
-    ///
-    /// # Returns
-    /// Total monthly premium amount for the owner's active policies
-    pub fn get_total_monthly_premium(env: Env, owner: Address) -> i128 {
-        if let Some(totals) = Self::get_active_premium_totals_map(&env) {
-            if let Some(total) = totals.get(owner.clone()) {
-                return total;
-            }
-        }
-
-        let mut total = 0i128;
-        let policies: Map<u32, InsurancePolicy> = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("POLICIES"))
-            .unwrap_or_else(|| Map::new(&env));
-
-        for (_, policy) in policies.iter() {
-            if policy.active && policy.owner == owner {
-                total += policy.monthly_premium;
-            }
-        }
-        total
-    }
-
-    /// Deactivate a policy
-    ///
-    /// # Arguments
-    /// * `caller` - Address of the caller (must be the policy owner)
-    /// * `policy_id` - ID of the policy
-    ///
-    /// # Returns
-    /// True if deactivation was successful
-    ///
-    /// # Panics
-    /// - If caller is not the policy owner
-    /// - If policy is not found
+    /// Decrements the owner's active-policy counter and the global
+    /// `active_policies` stat so the slot becomes available for a new policy.
     pub fn deactivate_policy(
         env: Env,
         caller: Address,
         policy_id: u32,
     ) -> Result<bool, InsuranceError> {
         caller.require_auth();
-        Self::require_not_paused(&env, pause_functions::DEACTIVATE)?;
+        Self::extend_instance_ttl(&env);
 
         let mut policies: Map<u32, InsurancePolicy> = env
             .storage()
             .instance()
-            .get(&symbol_short!("POLICIES"))
+            .get(&KEY_POLICIES)
             .unwrap_or_else(|| Map::new(&env));
-
-        let mut policy = policies.get(policy_id).unwrap_or_else(|| panic!("Policy not found"));
-        let mut policy = policies
-            .get(policy_id)
-            .ok_or(InsuranceError::PolicyNotFound)?;
-
+        let mut policy = match policies.get(policy_id) {
+            Some(p) => p,
+            None => return Err(InsuranceError::PolicyNotFound),
+        };
         if policy.owner != caller {
             return Err(InsuranceError::Unauthorized);
         }
 
+        // Only decrement if the policy was still active.
         let was_active = policy.active;
         policy.active = false;
-        let policy_external_ref = policy.external_ref.clone();
-        policies.set(policy_id, policy);
-        let premium_amount = policy.monthly_premium;
         policies.set(policy_id, policy.clone());
-        env.storage()
-            .instance()
-            .set(&symbol_short!("POLICIES"), &policies);
+        env.storage().instance().set(&KEY_POLICIES, &policies);
 
         if was_active {
-            Self::adjust_active_premium_total(&env, &caller, -premium_amount);
+            Self::adjust_owner_active(&env, &caller, -1);
+            let mut stats = Self::read_stats(&env);
+            stats.active_policies = stats.active_policies.saturating_sub(1);
+            stats.last_updated = env.ledger().timestamp();
+            Self::write_stats(&env, stats);
         }
-        let event = PolicyDeactivatedEvent {
-            policy_id,
-            name: policy.name.clone(),
-            timestamp: env.ledger().timestamp(),
-        };
-        env.events().publish((POLICY_DEACTIVATED,), event);
-        env.events().publish(
-            (symbol_short!("insure"), InsuranceEvent::PolicyDeactivated),
-            (policy_id, caller, policy_external_ref),
-        );
 
-        true
+        Ok(true)
     }
 
-    /// Set or clear an external reference ID for a policy
-    ///
-    /// # Arguments
-    /// * `caller` - Address of the caller (must be the policy owner)
-    /// * `policy_id` - ID of the policy
-    /// * `external_ref` - Optional external system reference ID
-    ///
-    /// # Returns
-    /// True if the reference update was successful
-    ///
-    /// # Panics
-    /// - If caller is not the policy owner
-    /// - If policy is not found
     pub fn set_external_ref(
         env: Env,
         caller: Address,
@@ -1064,1343 +382,793 @@ impl Insurance {
         external_ref: Option<String>,
     ) -> bool {
         caller.require_auth();
-
         Self::extend_instance_ttl(&env);
+
+        if let Some(ref_value) = external_ref.clone() {
+            Self::validate_external_ref(&ref_value);
+        }
+
         let mut policies: Map<u32, InsurancePolicy> = env
             .storage()
             .instance()
-            .get(&symbol_short!("POLICIES"))
+            .get(&KEY_POLICIES)
             .unwrap_or_else(|| Map::new(&env));
+        let mut policy = match policies.get(policy_id) {
+            Some(p) => p,
+            None => return false,
+        };
 
-        let mut policy = policies.get(policy_id).expect("Policy not found");
         if policy.owner != caller {
-            panic!("Only the policy owner can update this policy reference");
+            return false;
         }
+
+        let old_external_ref = policy.external_ref.clone();
+
+        if external_ref == old_external_ref {
+            return true;
+        }
+
+        if let Some(new_ref) = external_ref.clone() {
+            Self::ensure_external_ref_available(&env, &policy.owner, &new_ref, Some(policy_id));
+        }
+
+        Self::unbind_external_ref(&env, &policy.owner, policy_id, &old_external_ref);
+        Self::bind_external_ref(&env, &policy.owner, policy_id, &external_ref);
 
         policy.external_ref = external_ref.clone();
         policies.set(policy_id, policy);
-        env.storage()
-            .instance()
-            .set(&symbol_short!("POLICIES"), &policies);
+        env.storage().instance().set(&KEY_POLICIES, &policies);
 
         env.events().publish(
-            (symbol_short!("insure"), InsuranceEvent::ExternalRefUpdated),
-            (policy_id, caller, external_ref),
-            (symbol_short!("insuranc"), InsuranceEvent::PolicyDeactivated),
-            (policy_id, caller),
+            (EVENT_EXTERNAL_REF_UPDATED,),
+            ExternalRefUpdatedEvent {
+                policy_id,
+                owner: caller,
+                external_ref,
+            },
         );
 
-        Ok(true)
+        true
     }
 
-    /// Extend the TTL of instance storage
-    fn extend_instance_ttl(env: &Env) {
-        env.storage()
-            .instance()
-            .extend_ttl(INSTANCE_LIFETIME_THRESHOLD, INSTANCE_BUMP_AMOUNT);
-    }
+    pub fn archive_policy(env: Env, caller: Address, policy_id: u32) -> bool {
+        caller.require_auth();
+        Self::extend_instance_ttl(&env);
 
-    fn get_active_premium_totals_map(env: &Env) -> Option<Map<Address, i128>> {
-        env.storage().instance().get(&STORAGE_PREMIUM_TOTALS)
-    }
-
-    fn adjust_active_premium_total(env: &Env, owner: &Address, delta: i128) {
-        if delta == 0 {
-            return;
-        }
-        let mut totals: Map<Address, i128> = env
+        let mut policies: Map<u32, InsurancePolicy> = env
             .storage()
             .instance()
-            .get(&STORAGE_PREMIUM_TOTALS)
-            .unwrap_or_else(|| Map::new(env));
-        let current = totals.get(owner.clone()).unwrap_or(0);
-        let next = if delta >= 0 {
-            current.saturating_add(delta)
-        } else {
-            current.saturating_sub(delta.saturating_abs())
+            .get(&KEY_POLICIES)
+            .unwrap_or_else(|| Map::new(&env));
+        let mut archived: Map<u32, ArchivedPolicy> = env
+            .storage()
+            .instance()
+            .get(&KEY_ARCHIVED_POLICIES)
+            .unwrap_or_else(|| Map::new(&env));
+
+        let policy = match policies.get(policy_id) {
+            Some(p) => p,
+            None => return false,
         };
-        totals.set(owner.clone(), next);
+        if policy.owner != caller {
+            return false;
+        }
+
+        Self::unbind_external_ref(&env, &policy.owner, policy_id, &policy.external_ref);
+
+        archived.set(
+            policy_id,
+            ArchivedPolicy {
+                id: policy.id,
+                owner: policy.owner,
+                name: policy.name,
+                external_ref: policy.external_ref,
+                coverage_type: policy.coverage_type,
+                monthly_premium: policy.monthly_premium,
+                coverage_amount: policy.coverage_amount,
+                next_payment_date: policy.next_payment_date,
+            },
+        );
+        policies.remove(policy_id);
+
+        env.storage().instance().set(&KEY_POLICIES, &policies);
         env.storage()
             .instance()
-            .set(&STORAGE_PREMIUM_TOTALS, &totals);
+            .set(&KEY_ARCHIVED_POLICIES, &archived);
+        true
     }
 
-    // -----------------------------------------------------------------------
-    // Schedule operations (unchanged)
-    // -----------------------------------------------------------------------
-    pub fn create_premium_schedule(
+    pub fn restore_policy(env: Env, caller: Address, policy_id: u32) -> bool {
+        caller.require_auth();
+        Self::extend_instance_ttl(&env);
+
+        let mut policies: Map<u32, InsurancePolicy> = env
+            .storage()
+            .instance()
+            .get(&KEY_POLICIES)
+            .unwrap_or_else(|| Map::new(&env));
+        let mut archived: Map<u32, ArchivedPolicy> = env
+            .storage()
+            .instance()
+            .get(&KEY_ARCHIVED_POLICIES)
+            .unwrap_or_else(|| Map::new(&env));
+
+        let archived_policy = match archived.get(policy_id) {
+            Some(p) => p,
+            None => return false,
+        };
+        if archived_policy.owner != caller {
+            return false;
+        }
+
+        if let Some(ref_value) = archived_policy.external_ref.clone() {
+            let index = Self::get_external_ref_index(&env);
+            if let Some(existing_id) = index.get((archived_policy.owner.clone(), ref_value)) {
+                if existing_id != policy_id {
+                    return false;
+                }
+            }
+        }
+
+        Self::bind_external_ref(
+            &env,
+            &archived_policy.owner,
+            policy_id,
+            &archived_policy.external_ref,
+        );
+
+        policies.set(
+            policy_id,
+            InsurancePolicy {
+                id: archived_policy.id,
+                owner: archived_policy.owner,
+                name: archived_policy.name,
+                external_ref: archived_policy.external_ref,
+                coverage_type: archived_policy.coverage_type,
+                monthly_premium: archived_policy.monthly_premium,
+                coverage_amount: archived_policy.coverage_amount,
+                active: true,
+                next_payment_date: archived_policy.next_payment_date,
+            },
+        );
+        archived.remove(policy_id);
+
+        env.storage().instance().set(&KEY_POLICIES, &policies);
+        env.storage()
+            .instance()
+            .set(&KEY_ARCHIVED_POLICIES, &archived);
+        true
+    }
+
+    pub fn get_archived_policy(env: Env, policy_id: u32) -> Option<ArchivedPolicy> {
+        Self::extend_instance_ttl(&env);
+        let archived: Map<u32, ArchivedPolicy> = env
+            .storage()
+            .instance()
+            .get(&KEY_ARCHIVED_POLICIES)
+            .unwrap_or_else(|| Map::new(&env));
+        archived.get(policy_id)
+    }
+
+    pub fn get_policy_id_by_external_ref(
         env: Env,
         owner: Address,
-        policy_id: u32,
-        next_due: u64,
-        interval: u64,
-    ) -> Result<u32, InsuranceError> {
-        // Changed to Result
-        owner.require_auth();
-        Self::require_not_paused(&env, pause_functions::CREATE_SCHED)?;
+        external_ref: String,
+    ) -> Option<u32> {
+        Self::extend_instance_ttl(&env);
 
-        let name = String::from_str(&env, "Health Insurance");
-        let coverage_type = String::from_str(&env, "health");
-        let monthly_premium = 100;
-        let coverage_amount = 10000;
-        let external_ref = Some(String::from_str(&env, "POLICY-EXT-1"));
+        let len = external_ref.len();
+        if len == 0 || len > MAX_EXTERNAL_REF_LEN {
+            return None;
+        }
+        let copy_len = len as usize;
+        let mut buf = [0u8; MAX_EXTERNAL_REF_LEN as usize];
+        external_ref.copy_into_slice(&mut buf[..copy_len]);
+        if !buf[..copy_len]
+            .iter()
+            .all(|&b| Self::is_allowed_external_ref_byte(b))
+        {
+            return None;
+        }
 
-        let policy_id = client.create_policy(
-            &owner,
-            &name,
-            &coverage_type,
-            &monthly_premium,
-            &coverage_amount,
-            &external_ref,
-        );
+        let index = Self::get_external_ref_index(&env);
+        index.get((owner, external_ref))
+    }
+
+    pub fn pay_premium(env: Env, caller: Address, policy_id: u32) -> bool {
+        caller.require_auth();
+        Self::extend_instance_ttl(&env);
+
         let mut policies: Map<u32, InsurancePolicy> = env
             .storage()
             .instance()
-            .get(&symbol_short!("POLICIES"))
+            .get(&KEY_POLICIES)
             .unwrap_or_else(|| Map::new(&env));
-
-        let mut policy = policies.get(policy_id).unwrap_or_else(|| panic!("Policy not found"));
-        let mut policy = policies
-            .get(policy_id)
-            .ok_or(InsuranceError::PolicyNotFound)?;
-
-        if policy.owner != owner {
-            return Err(InsuranceError::Unauthorized);
-        }
-
-        let policy = client.get_policy(&policy_id).unwrap();
-        assert_eq!(policy.id, 1);
-        assert_eq!(policy.owner, owner);
-        assert_eq!(policy.name, name);
-        assert_eq!(policy.external_ref, external_ref);
-        assert_eq!(policy.coverage_type, coverage_type);
-        assert_eq!(policy.monthly_premium, monthly_premium);
-        assert_eq!(policy.coverage_amount, coverage_amount);
-        assert!(policy.active);
-        assert_eq!(policy.next_payment_date, 1000000000 + (30 * 86400));
-    }
-        let current_time = env.ledger().timestamp();
-        if next_due <= current_time {
-            return Err(InsuranceError::InvalidTimestamp);
-        }
-
-        Self::extend_instance_ttl(&env);
-
-        let mut schedules: Map<u32, PremiumSchedule> = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("PREM_SCH"))
-            .unwrap_or_else(|| Map::new(&env));
-
-        client.create_policy(&owner, &name, &coverage_type, &0, &10000, &None);
-    }
-        let next_schedule_id = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("NEXT_PSCH"))
-            .unwrap_or(0u32)
-            + 1;
-
-        let schedule = PremiumSchedule {
-            id: next_schedule_id,
-            owner: owner.clone(),
-            policy_id,
-            next_due,
-            interval,
-            recurring: interval > 0,
-            active: true,
-            created_at: current_time,
-            last_executed: None,
-            missed_count: 0,
+        let mut policy = match policies.get(policy_id) {
+            Some(p) => p,
+            None => return false,
         };
-
-        policy.schedule_id = Some(next_schedule_id);
-
-        client.create_policy(&owner, &name, &coverage_type, &-100, &10000, &None);
-    }
-        schedules.set(next_schedule_id, schedule);
-        env.storage()
-            .instance()
-            .set(&symbol_short!("PREM_SCH"), &schedules);
-        env.storage()
-            .instance()
-            .set(&symbol_short!("NEXT_PSCH"), &next_schedule_id);
-
+        if policy.owner != caller || !policy.active {
+            return false;
+        }
+        let amount = policy.monthly_premium;
+        policy.next_payment_date = env.ledger().timestamp() + (30 * 86_400);
+        let next_payment_date = policy.next_payment_date;
         policies.set(policy_id, policy);
-        env.storage()
-            .instance()
-            .set(&symbol_short!("POLICIES"), &policies);
+        env.storage().instance().set(&KEY_POLICIES, &policies);
 
-        env.events().publish(
-            (symbol_short!("insure"), InsuranceEvent::ScheduleCreated),
-            (next_schedule_id, owner),
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::Transaction,
+            EventPriority::Low,
+            EVT_PREMIUM_PAID,
+            PremiumPaidEvent {
+                policy_id,
+                owner: caller,
+                amount,
+                next_payment_date,
+                timestamp: env.ledger().timestamp(),
+            },
         );
 
-        Ok(next_schedule_id)
+        true
     }
 
-    /// Modify a premium schedule
-    pub fn modify_premium_schedule(
+    /// Update or clear the external reference for a policy.
+    ///
+    /// Emits an `ExternalRefUpdatedEvent` with topics
+    /// `("Remitwise", State=1, Low=0, "ext_ref")`.
+    pub fn set_external_ref(
         env: Env,
         caller: Address,
-        schedule_id: u32,
-        next_due: u64,
-        interval: u64,
-    ) -> Result<bool, InsuranceError> {
-        // Changed to Result
+        policy_id: u32,
+        external_ref: Option<String>,
+    ) -> bool {
         caller.require_auth();
-        Self::require_not_paused(&env, pause_functions::MODIFY_SCHED)?;
-
-        let current_time = env.ledger().timestamp();
-        if next_due <= current_time {
-            return Err(InsuranceError::InvalidTimestamp); // Use Err instead of panic
-        }
-
         Self::extend_instance_ttl(&env);
-
-        let mut schedules: Map<u32, PremiumSchedule> = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("PREM_SCH"))
-            .unwrap_or_else(|| Map::new(&env));
-
-        let mut schedule = schedules.get(schedule_id).unwrap_or_else(|| panic!("Schedule not found"));
-        let mut schedule = schedules
-            .get(schedule_id)
-            .ok_or(InsuranceError::PolicyNotFound)?;
-
-        if schedule.owner != caller {
-            return Err(InsuranceError::Unauthorized); // Use Err instead of panic
-        }
-
-        schedule.next_due = next_due;
-        schedule.interval = interval;
-        schedule.recurring = interval > 0;
-
-        schedules.set(schedule_id, schedule);
-        env.storage()
-            .instance()
-            .set(&symbol_short!("PREM_SCH"), &schedules);
-
-        env.events().publish(
-            (symbol_short!("insure"), InsuranceEvent::ScheduleModified),
-            (schedule_id, caller),
-        );
-
-        Ok(true) // Wrap return value in Ok
-    }
-
-    /// Cancel a premium schedule
-    pub fn cancel_premium_schedule(
-        env: Env,
-        caller: Address,
-        schedule_id: u32,
-    ) -> Result<bool, InsuranceError> {
-        caller.require_auth();
-        Self::require_not_paused(&env, pause_functions::CANCEL_SCHED)?;
-
-        Self::extend_instance_ttl(&env);
-
-        let mut schedules: Map<u32, PremiumSchedule> = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("PREM_SCH"))
-            .unwrap_or_else(|| Map::new(&env));
-
-        let mut schedule = schedules.get(schedule_id).unwrap_or_else(|| panic!("Schedule not found"));
-        let mut schedule = schedules
-            .get(schedule_id)
-            .ok_or(InsuranceError::PolicyNotFound)?;
-
-        if schedule.owner != caller {
-            return Err(InsuranceError::Unauthorized);
-        }
-
-        schedule.active = false;
-
-        schedules.set(schedule_id, schedule);
-        env.storage()
-            .instance()
-            .set(&symbol_short!("PREM_SCH"), &schedules);
-
-        env.events().publish(
-            (symbol_short!("insure"), InsuranceEvent::ScheduleCancelled),
-            (schedule_id, caller),
-        );
-
-        Ok(true)
-    }
-
-    /// Execute due premium schedules (public, callable by anyone - keeper pattern)
-    pub fn execute_due_premium_schedules(env: Env) -> Vec<u32> {
-        Self::extend_instance_ttl(&env);
-
-        let current_time = env.ledger().timestamp();
-        let mut executed = Vec::new(&env);
-
-        let mut schedules: Map<u32, PremiumSchedule> = env
-            .storage()
-            .instance()
-            .get(&symbol_short!("PREM_SCH"))
-            .unwrap_or_else(|| Map::new(&env));
 
         let mut policies: Map<u32, InsurancePolicy> = env
             .storage()
             .instance()
-            .get(&symbol_short!("POLICIES"))
+            .get(&KEY_POLICIES)
+            .unwrap_or_else(|| Map::new(&env));
+        let mut policy = match policies.get(policy_id) {
+            Some(p) => p,
+            None => return false,
+        };
+        if policy.owner != caller {
+            return false;
+        }
+        policy.external_ref = external_ref.clone();
+        policies.set(policy_id, policy);
+        env.storage().instance().set(&KEY_POLICIES, &policies);
+
+        RemitwiseEvents::emit(
+            &env,
+            EventCategory::State,
+            EventPriority::Low,
+            EVT_EXT_REF_UPDATED,
+            ExternalRefUpdatedEvent {
+                policy_id,
+                owner: caller,
+                external_ref,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        true
+    }
+
+    pub fn batch_pay_premiums(env: Env, caller: Address, policy_ids: Vec<u32>) -> u32 {
+        caller.require_auth();
+        Self::extend_instance_ttl(&env);
+
+        let mut policies: Map<u32, InsurancePolicy> = env
+            .storage()
+            .instance()
+            .get(&KEY_POLICIES)
             .unwrap_or_else(|| Map::new(&env));
 
-        for (schedule_id, mut schedule) in schedules.iter() {
-            if !schedule.active || schedule.next_due > current_time {
+        let mut count: u32 = 0;
+        let next_date = env.ledger().timestamp() + (30 * 86_400);
+        let ts = env.ledger().timestamp();
+
+        for id in policy_ids.iter() {
+            if let Some(mut p) = policies.get(id) {
+                if p.owner == caller && p.active {
+                    let amount = p.monthly_premium;
+                    p.next_payment_date = next_date;
+                    policies.set(id, p);
+
+                    RemitwiseEvents::emit(
+                        &env,
+                        EventCategory::Transaction,
+                        EventPriority::Low,
+                        EVT_PREMIUM_PAID,
+                        PremiumPaidEvent {
+                            policy_id: id,
+                            owner: caller.clone(),
+                            amount,
+                            next_payment_date: next_date,
+                            timestamp: ts,
+                        },
+                    );
+
+                    count += 1;
+                }
+            }
+        }
+        env.storage().instance().set(&KEY_POLICIES, &policies);
+        count
+    }
+
+    pub fn get_total_monthly_premium(env: Env, owner: Address) -> i128 {
+        Self::extend_instance_ttl(&env);
+
+        let policies: Map<u32, InsurancePolicy> = env
+            .storage()
+            .instance()
+            .get(&KEY_POLICIES)
+            .unwrap_or_else(|| Map::new(&env));
+        let index: Map<Address, Vec<u32>> = env
+            .storage()
+            .instance()
+            .get(&KEY_OWNER_INDEX)
+            .unwrap_or_else(|| Map::new(&env));
+
+        let ids = index.get(owner).unwrap_or_else(|| Vec::new(&env));
+        let mut total: i128 = 0;
+        for id in ids.iter() {
+            if let Some(p) = policies.get(id) {
+                if p.active {
+                    total += p.monthly_premium;
+                }
+            }
+        }
+        total
+    }
+
+    /// Returns a stable, cursor-based page of active policies for an owner.
+    pub fn get_active_policies(env: Env, owner: Address, cursor: u32, limit: u32) -> PolicyPage {
+        Self::extend_instance_ttl(&env);
+        let limit = Self::clamp_limit(limit);
+
+        let policies: Map<u32, InsurancePolicy> = env
+            .storage()
+            .instance()
+            .get(&KEY_POLICIES)
+            .unwrap_or_else(|| Map::new(&env));
+        let index: Map<Address, Vec<u32>> = env
+            .storage()
+            .instance()
+            .get(&KEY_OWNER_INDEX)
+            .unwrap_or_else(|| Map::new(&env));
+        let ids = index.get(owner).unwrap_or_else(|| Vec::new(&env));
+
+        let mut items: Vec<InsurancePolicy> = Vec::new(&env);
+        let mut next_cursor: u32 = 0;
+
+        for id in ids.iter() {
+            if id <= cursor {
                 continue;
             }
-
-            if let Some(mut policy) = policies.get(schedule.policy_id) {
-                if policy.active {
-                    policy.next_payment_date = current_time + (30 * 86400);
-                    policies.set(schedule.policy_id, policy.clone());
-
-                    env.events().publish(
-                        (symbol_short!("insure"), InsuranceEvent::PremiumPaid),
-                        (schedule.policy_id, policy.owner),
-                    );
+            if let Some(p) = policies.get(id) {
+                if !p.active {
+                    continue;
+                }
+                items.push_back(p);
+                next_cursor = id;
+                if items.len() >= limit {
+                    break;
                 }
             }
-
-            schedule.last_executed = Some(current_time);
-
-            if schedule.recurring && schedule.interval > 0 {
-                let mut missed = 0u32;
-                let mut next = schedule.next_due + schedule.interval;
-                while next <= current_time {
-                    missed += 1;
-                    next += schedule.interval;
-                }
-                schedule.missed_count += missed;
-                schedule.next_due = next;
-
-                if missed > 0 {
-                    env.events().publish(
-                        (symbol_short!("insure"), InsuranceEvent::ScheduleMissed),
-                        (schedule_id, missed),
-                    );
-                }
-            } else {
-                schedule.active = false;
-            }
-
-            schedules.set(schedule_id, schedule);
-            executed.push_back(schedule_id);
-
-            env.events().publish(
-                (symbol_short!("insure"), InsuranceEvent::ScheduleExecuted),
-                schedule_id,
-            );
         }
 
-        env.storage()
-            .instance()
-            .set(&symbol_short!("PREM_SCH"), &schedules);
-        env.storage()
-            .instance()
-            .set(&symbol_short!("POLICIES"), &policies);
-
-        executed
+        let out_cursor = if items.len() < limit { 0 } else { next_cursor };
+        let count = items.len();
+        PolicyPage {
+            items,
+            next_cursor: out_cursor,
+            count,
+        }
     }
 
-    /// Get all premium schedules for an owner
-    pub fn get_premium_schedules(env: Env, owner: Address) -> Vec<PremiumSchedule> {
-        let schedules: Map<u32, PremiumSchedule> = env
+    // -----------------------------------------------------------------------
+    // Archive / restore / cleanup
+    // -----------------------------------------------------------------------
+
+    /// Move all **inactive** policies owned by `caller` into the archive.
+    ///
+    /// Returns the number of policies archived. Increments
+    /// `StorageStats::archived_policies` by that count. The `active_policies`
+    /// counter is unaffected because `deactivate_policy` already decremented it.
+    pub fn archive_policies(env: Env, caller: Address) -> u32 {
+        caller.require_auth();
+        Self::extend_instance_ttl(&env);
+
+        let mut policies: Map<u32, InsurancePolicy> = env
             .storage()
             .instance()
-            .get(&symbol_short!("PREM_SCH"))
+            .get(&KEY_POLICIES)
+            .unwrap_or_else(|| Map::new(&env));
+        let mut archived: Map<u32, ArchivedPolicy> = env
+            .storage()
+            .instance()
+            .get(&KEY_ARCHIVED)
             .unwrap_or_else(|| Map::new(&env));
 
-        let mut result = Vec::new(&env);
-        for (_, schedule) in schedules.iter() {
-            if schedule.owner == owner {
-                result.push_back(schedule);
+        let now = env.ledger().timestamp();
+        let mut to_remove: Vec<u32> = Vec::new(&env);
+        let mut count: u32 = 0;
+
+        for (id, policy) in policies.iter() {
+            if policy.owner == caller && !policy.active {
+                archived.set(
+                    id,
+                    ArchivedPolicy {
+                        id: policy.id,
+                        owner: policy.owner.clone(),
+                        name: policy.name.clone(),
+                        coverage_type: policy.coverage_type,
+                        monthly_premium: policy.monthly_premium,
+                        coverage_amount: policy.coverage_amount,
+                        archived_at: now,
+                    },
+                );
+                to_remove.push_back(id);
+                count += 1;
             }
         }
-        result
+
+        for id in to_remove.iter() {
+            policies.remove(id);
+        }
+
+        env.storage().instance().set(&KEY_POLICIES, &policies);
+        env.storage().instance().set(&KEY_ARCHIVED, &archived);
+
+        if count > 0 {
+            let mut stats = Self::read_stats(&env);
+            stats.archived_policies = stats.archived_policies.saturating_add(count);
+            stats.last_updated = now;
+            Self::write_stats(&env, stats);
+        }
+
+        count
     }
 
-    /// Get a specific premium schedule
-    pub fn get_premium_schedule(env: Env, schedule_id: u32) -> Option<PremiumSchedule> {
-        let schedules: Map<u32, PremiumSchedule> = env
+    /// Restore an archived policy back to active storage.
+    ///
+    /// The restored policy is marked **inactive** (the caller must explicitly
+    /// reactivate it via a future mechanism if needed). Decrements
+    /// `archived_policies` and increments `active_policies`.
+    ///
+    /// # Errors
+    /// - `PolicyNotFound` if no archived policy with `policy_id` exists.
+    /// - `Unauthorized` if `caller` is not the policy owner.
+    pub fn restore_policy(env: Env, caller: Address, policy_id: u32) -> Result<(), InsuranceError> {
+        caller.require_auth();
+        Self::extend_instance_ttl(&env);
+
+        let mut archived: Map<u32, ArchivedPolicy> = env
             .storage()
             .instance()
-            .get(&symbol_short!("PREM_SCH"))
+            .get(&KEY_ARCHIVED)
+            .unwrap_or_else(|| Map::new(&env));
+        let record = match archived.get(policy_id) {
+            Some(r) => r,
+            None => return Err(InsuranceError::PolicyNotFound),
+        };
+        if record.owner != caller {
+            return Err(InsuranceError::Unauthorized);
+        }
+
+        // Enforce cap on restore as well — restoring counts as gaining an active slot.
+        let active_count = Self::owner_active_count(&env, &caller);
+        if active_count >= MAX_POLICIES_PER_OWNER {
+            return Err(InsuranceError::PolicyLimitExceeded);
+        }
+
+        let mut policies: Map<u32, InsurancePolicy> = env
+            .storage()
+            .instance()
+            .get(&KEY_POLICIES)
             .unwrap_or_else(|| Map::new(&env));
 
-        schedules.get(schedule_id)
+        policies.set(
+            policy_id,
+            InsurancePolicy {
+                id: record.id,
+                owner: record.owner.clone(),
+                name: record.name.clone(),
+                external_ref: None,
+                coverage_type: record.coverage_type,
+                monthly_premium: record.monthly_premium,
+                coverage_amount: record.coverage_amount,
+                // Restored as inactive; owner decides whether to reactivate.
+                active: false,
+                next_payment_date: env.ledger().timestamp() + (30 * 86_400),
+            },
+        );
+        archived.remove(policy_id);
+
+        env.storage().instance().set(&KEY_POLICIES, &policies);
+        env.storage().instance().set(&KEY_ARCHIVED, &archived);
+
+        let mut stats = Self::read_stats(&env);
+        stats.archived_policies = stats.archived_policies.saturating_sub(1);
+        // Restored policy is inactive, so active_policies is unchanged here.
+        stats.last_updated = env.ledger().timestamp();
+        Self::write_stats(&env, stats);
+
+        Ok(())
+    }
+
+    /// Permanently delete archived policies with `archived_at < before_timestamp`.
+    ///
+    /// Returns the number of records deleted. Decrements `archived_policies`
+    /// by that count.
+    pub fn cleanup_policies(env: Env, caller: Address, before_timestamp: u64) -> u32 {
+        caller.require_auth();
+        Self::extend_instance_ttl(&env);
+
+        let mut archived: Map<u32, ArchivedPolicy> = env
+            .storage()
+            .instance()
+            .get(&KEY_ARCHIVED)
+            .unwrap_or_else(|| Map::new(&env));
+
+        let mut to_remove: Vec<u32> = Vec::new(&env);
+        let mut count: u32 = 0;
+
+        for (id, record) in archived.iter() {
+            if record.archived_at < before_timestamp {
+                to_remove.push_back(id);
+                count += 1;
+            }
+        }
+
+        for id in to_remove.iter() {
+            archived.remove(id);
+        }
+
+        env.storage().instance().set(&KEY_ARCHIVED, &archived);
+
+        if count > 0 {
+            let mut stats = Self::read_stats(&env);
+            stats.archived_policies = stats.archived_policies.saturating_sub(count);
+            stats.last_updated = env.ledger().timestamp();
+            Self::write_stats(&env, stats);
+        }
+
+        count
+    }
+
+    /// Return a snapshot of contract storage usage.
+    pub fn get_storage_stats(env: Env) -> StorageStats {
+        Self::extend_instance_ttl(&env);
+        Self::read_stats(&env)
+    }
+
+    /// Set or clear the `external_ref` on a policy owned by `caller`.
+    pub fn set_external_ref(
+        env: Env,
+        caller: Address,
+        policy_id: u32,
+        external_ref: Option<String>,
+    ) -> Result<(), InsuranceError> {
+        caller.require_auth();
+        Self::extend_instance_ttl(&env);
+
+        let mut policies: Map<u32, InsurancePolicy> = env
+            .storage()
+            .instance()
+            .get(&KEY_POLICIES)
+            .unwrap_or_else(|| Map::new(&env));
+        let mut policy = match policies.get(policy_id) {
+            Some(p) => p,
+            None => return Err(InsuranceError::PolicyNotFound),
+        };
+        if policy.owner != caller {
+            return Err(InsuranceError::Unauthorized);
+        }
+        policy.external_ref = external_ref;
+        policies.set(policy_id, policy);
+        env.storage().instance().set(&KEY_POLICIES, &policies);
+        Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{Insurance, InsuranceClient};
+    use remitwise_common::CoverageType;
+    use soroban_sdk::testutils::Address as _;
+    use soroban_sdk::{Address, Env, String};
+
+    fn setup() -> (Env, InsuranceClient<'static>, Address, Address) {
+        let env = Env::default();
+        env.mock_all_auths();
+        let contract_id = env.register_contract(None, Insurance);
+        let client = InsuranceClient::new(&env, &contract_id);
+        let owner_a = Address::generate(&env);
+        let owner_b = Address::generate(&env);
+        (env, client, owner_a, owner_b)
+    }
+
+    fn policy_name(env: &Env) -> String {
+        String::from_str(env, "Policy")
+    }
+
+    fn ext(env: &Env, v: &str) -> Option<String> {
+        Some(String::from_str(env, v))
+    }
+
+    #[test]
+    #[should_panic(expected = "external_ref already in use for owner")]
+    fn duplicate_external_ref_same_owner_panics() {
+        let (env, client, owner, _) = setup();
+        let name = policy_name(&env);
+        client.create_policy(
+            &owner,
+            &name,
+            &CoverageType::Health,
+            &100,
+            &10_000,
+            &ext(&env, "INV-001"),
+        );
+        client.create_policy(
+            &owner,
+            &name,
+            &CoverageType::Life,
+            &200,
+            &20_000,
+            &ext(&env, "INV-001"),
+        );
+    }
+
+    #[test]
+    fn duplicate_external_ref_different_owners_allowed() {
+        let (env, client, owner_a, owner_b) = setup();
+        let name = policy_name(&env);
+
+        let id_a = client.create_policy(
+            &owner_a,
+            &name,
+            &CoverageType::Health,
+            &100,
+            &10_000,
+            &ext(&env, "INV-001"),
+        );
+        let id_b = client.create_policy(
+            &owner_b,
+            &name,
+            &CoverageType::Health,
+            &100,
+            &10_000,
+            &ext(&env, "INV-001"),
+        );
+
+        assert_eq!(
+            client.get_policy_id_by_external_ref(&owner_a, &String::from_str(&env, "INV-001")),
+            Some(id_a)
+        );
+        assert_eq!(
+            client.get_policy_id_by_external_ref(&owner_b, &String::from_str(&env, "INV-001")),
+            Some(id_b)
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "invalid external_ref charset")]
+    fn invalid_external_ref_charset_panics() {
+        let (env, client, owner, _) = setup();
+        let name = policy_name(&env);
+        client.create_policy(
+            &owner,
+            &name,
+            &CoverageType::Health,
+            &100,
+            &10_000,
+            &ext(&env, "bad ref"),
+        );
+    }
+
+    #[test]
+    fn clearing_external_ref_allows_reuse() {
+        let (env, client, owner, _) = setup();
+        let name = policy_name(&env);
+
+        let id1 = client.create_policy(
+            &owner,
+            &name,
+            &CoverageType::Health,
+            &100,
+            &10_000,
+            &ext(&env, "INV-002"),
+        );
+
+        assert!(client.set_external_ref(&owner, &id1, &None));
+        assert_eq!(
+            client.get_policy_id_by_external_ref(&owner, &String::from_str(&env, "INV-002")),
+            None
+        );
+
+        let id2 = client.create_policy(
+            &owner,
+            &name,
+            &CoverageType::Life,
+            &100,
+            &10_000,
+            &ext(&env, "INV-002"),
+        );
+        assert_eq!(
+            client.get_policy_id_by_external_ref(&owner, &String::from_str(&env, "INV-002")),
+            Some(id2)
+        );
+    }
+
+    #[test]
+    fn deactivate_clears_external_ref_mapping_allows_reuse() {
+        let (env, client, owner, _) = setup();
+        let name = policy_name(&env);
+
+        let id1 = client.create_policy(
+            &owner,
+            &name,
+            &CoverageType::Health,
+            &100,
+            &10_000,
+            &ext(&env, "INV-003"),
+        );
+        assert!(client.deactivate_policy(&owner, &id1));
+
+        let id2 = client.create_policy(
+            &owner,
+            &name,
+            &CoverageType::Property,
+            &100,
+            &10_000,
+            &ext(&env, "INV-003"),
+        );
+        assert_eq!(
+            client.get_policy_id_by_external_ref(&owner, &String::from_str(&env, "INV-003")),
+            Some(id2)
+        );
+    }
+
+    #[test]
+    fn restore_with_conflicting_external_ref_fails_closed() {
+        let (env, client, owner, _) = setup();
+        let name = policy_name(&env);
+
+        let id1 = client.create_policy(
+            &owner,
+            &name,
+            &CoverageType::Health,
+            &100,
+            &10_000,
+            &ext(&env, "INV-004"),
+        );
+        assert!(client.archive_policy(&owner, &id1));
+
+        let id2 = client.create_policy(
+            &owner,
+            &name,
+            &CoverageType::Auto,
+            &120,
+            &12_000,
+            &ext(&env, "INV-004"),
+        );
+
+        assert!(!client.restore_policy(&owner, &id1));
+        assert_eq!(
+            client.get_policy_id_by_external_ref(&owner, &String::from_str(&env, "INV-004")),
+            Some(id2)
+        );
+        assert!(client.get_archived_policy(&id1).is_some());
     }
 }
 
 #[cfg(test)]
 mod test;
-
-#[cfg(test)]
-mod test_events {
-    use super::*;
-    use proptest::prelude::*;
-    use soroban_sdk::testutils::storage::Instance as _;
-    use soroban_sdk::testutils::{Address as _, Events, Ledger, LedgerInfo};
-    use soroban_sdk::{Env, String};
-
-    fn make_env() -> Env {
-        Env::default()
-    }
-
-    fn setup_policies(
-        env: &Env,
-        client: &InsuranceClient,
-        owner: &Address,
-        count: u32,
-    ) -> Vec<u32> {
-        let mut ids = Vec::new(env);
-        for i in 0..count {
-            let id = client.create_policy(
-                owner,
-                &String::from_str(env, "Policy"),
-                &CoverageType::Health,
-                &(50i128 * (i as i128 + 1)),
-                &(10000i128 * (i as i128 + 1)),
-            );
-            ids.push_back(id);
-        }
-        ids
-    }
-
-    // --- get_active_policies ---
-
-    #[test]
-    fn test_create_policy_invalid_premium() {
-        let env = Env::default();
-        let contract_id = env.register_contract(None, Insurance);
-        let client = InsuranceClient::new(&env, &contract_id);
-        let owner = Address::generate(&env);
-
-        let page = client.get_active_policies(&owner, &0, &0);
-        assert_eq!(page.count, 0);
-        assert_eq!(page.next_cursor, 0);
-    }
-
-        client.create_policy(&owner, &name, &coverage_type, &100, &0, &None);
-    #[test]
-    fn test_get_active_policies_single_page() {
-        let env = make_env();
-        env.mock_all_auths();
-
-        // Use the .try_ version of the function to capture the error result
-        let result = client.try_create_policy(
-            &owner,
-            &String::from_str(&env, "Life"),
-            &String::from_str(&env, "Health"),
-            &0, // This is invalid
-            &10000,
-        );
-
-        // Assert that the result matches our custom error code
-        assert_eq!(result, Err(Ok(InsuranceError::InvalidAmount)));
-    }
-
-    #[test]
-    fn test_create_policy_emits_event() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, Insurance);
-        let client = InsuranceClient::new(&env, &contract_id);
-        let owner = Address::generate(&env);
-
-        // No policies created — policy ID 999 does not exist; contract panics
-        let result = client.try_pay_premium(&owner, &999u32);
-        // Create a policy
-        let policy_id = client.create_policy(
-            &owner,
-            &String::from_str(&env, "Health Insurance"),
-            &String::from_str(&env, "health"),
-            &100,
-            &50000,
-        );
-        assert_eq!(policy_id, 1);
-
-        // Contract panics when policy not found
-        assert!(result.is_err());
-    }
-
-    #[test]
-    fn test_get_active_policies_pagination() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, Insurance);
-        let client = InsuranceClient::new(&env, &contract_id);
-        let owner = Address::generate(&env);
-
-        let name = String::from_str(&env, "Health Insurance");
-        let coverage_type = String::from_str(&env, "health");
-        let policy_id = client.create_policy(&owner, &name, &coverage_type, &100, &10000, &None);
-        setup_policies(&env, &client, &owner, 7);
-
-        let page1 = client.get_active_policies(&owner, &0, &3);
-        assert_eq!(page1.count, 3);
-        assert!(page1.next_cursor > 0);
-
-        let page2 = client.get_active_policies(&owner, &page1.next_cursor, &3);
-        assert_eq!(page2.count, 3);
-        assert!(page2.next_cursor > 0);
-
-        let page3 = client.get_active_policies(&owner, &page2.next_cursor, &3);
-        assert_eq!(page3.count, 1);
-        assert_eq!(page3.next_cursor, 0);
-    }
-        // Create a policy
-        let policy_id = client.create_policy(
-            &owner,
-            &String::from_str(&env, "Emergency Coverage"),
-            &String::from_str(&env, "emergency"),
-            &75,
-            &25000,
-        );
-
-        env.mock_all_auths();
-
-        let name = String::from_str(&env, "Health Insurance");
-        let coverage_type = String::from_str(&env, "health");
-        let policy_id = client.create_policy(&owner, &name, &coverage_type, &100, &10000, &None);
-        let ids = setup_policies(&env, &client, &owner, 4);
-        // Deactivate policy #2
-        client.deactivate_policy(&owner, &ids.get(1).unwrap());
-
-        let page = client.get_active_policies(&owner, &0, &10);
-        assert_eq!(page.count, 3); // only 3 active
-        for p in page.items.iter() {
-            assert!(p.active, "only active policies should be returned");
-        }
-    }
-
-    #[test]
-    fn test_get_active_policies_multi_owner_isolation() {
-        let env = make_env();
-        env.mock_all_auths();
-        let id = env.register_contract(None, Insurance);
-        let client = InsuranceClient::new(&env, &id);
-        let owner_a = Address::generate(&env);
-        let owner_b = Address::generate(&env);
-        // Get events before paying premium
-        let events_before = env.events().all().len();
-
-        // Pay premium
-        let result = client.pay_premium(&owner, &policy_id);
-        assert!(result);
-
-        // Verify PremiumPaid event was emitted (2 new events: topic + enum)
-        let events_after = env.events().all().len();
-        assert_eq!(events_after - events_before, 2);
-    }
-
-    #[test]
-    fn test_deactivate_policy_emits_event() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, Insurance);
-        let client = InsuranceClient::new(&env, &contract_id);
-        let owner = Address::generate(&env);
-
-        // Create a policy
-        let policy_id = client.create_policy(
-            &owner,
-            &String::from_str(&env, "Life Insurance"),
-            &String::from_str(&env, "life"),
-            &200,
-            &100000,
-        );
-
-        env.mock_all_auths();
-
-        // Get events before deactivating
-        let events_before = env.events().all().len();
-
-        // Deactivate policy
-        let result = client.deactivate_policy(&owner, &policy_id);
-        assert!(result);
-
-        // Verify PolicyDeactivated event was emitted (2 new events: topic + enum)
-        let events_after = env.events().all().len();
-        assert_eq!(events_after - events_before, 2);
-    }
-
-    #[test]
-    fn test_create_policy_emits_event_exists() {
-        let env = make_env();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, Insurance);
-        let client = InsuranceClient::new(&env, &contract_id);
-        let owner = Address::generate(&env);
-
-        // Create multiple policies
-        let name1 = String::from_str(&env, "Health Insurance");
-        let coverage_type1 = String::from_str(&env, "health");
-        let policy_id1 = client.create_policy(&owner, &name1, &coverage_type1, &100, &10000, &None);
-
-        let name2 = String::from_str(&env, "Emergency Insurance");
-        let coverage_type2 = String::from_str(&env, "emergency");
-        let policy_id2 = client.create_policy(&owner, &name2, &coverage_type2, &200, &20000, &None);
-
-        let name3 = String::from_str(&env, "Life Insurance");
-        let coverage_type3 = String::from_str(&env, "life");
-        let policy_id3 = client.create_policy(&owner, &name3, &coverage_type3, &300, &30000, &None);
-        let policy_id = client.create_policy(
-        client.create_policy(
-            &owner,
-            &String::from_str(&env, "Health Insurance"),
-            &CoverageType::Health,
-            &String::from_str(&env, "Policy 1"),
-            &String::from_str(&env, "health"),
-            &100,
-            &50000,
-        );
-        client.create_policy(
-            &owner,
-            &String::from_str(&env, "Policy 2"),
-            &String::from_str(&env, "life"),
-            &200,
-            &100000,
-        );
-        client.create_policy(
-            &owner,
-            &String::from_str(&env, "Policy 3"),
-            &String::from_str(&env, "emergency"),
-            &75,
-            &25000,
-        );
-
-        client.pay_premium(&owner, &policy_id);
-
-        let events_after = env.events().all().len();
-        assert_eq!(events_after - events_before, 2);
-    }
-
-    #[test]
-    fn test_policy_lifecycle_emits_all_events() {
-        let env = Env::default();
-        env.mock_all_auths();
-        let contract_id = env.register_contract(None, Insurance);
-        let client = InsuranceClient::new(&env, &contract_id);
-        let owner = Address::generate(&env);
-
-        // Create multiple policies
-        let name1 = String::from_str(&env, "Health Insurance");
-        let coverage_type1 = String::from_str(&env, "health");
-        client.create_policy(&owner, &name1, &coverage_type1, &100, &10000, &None);
-
-        let name2 = String::from_str(&env, "Emergency Insurance");
-        let coverage_type2 = String::from_str(&env, "emergency");
-        client.create_policy(&owner, &name2, &coverage_type2, &200, &20000, &None);
-
-        let name3 = String::from_str(&env, "Life Insurance");
-        let coverage_type3 = String::from_str(&env, "life");
-        let policy_id3 = client.create_policy(&owner, &name3, &coverage_type3, &300, &30000, &None);
-        // Create a policy
-        let policy_id = client.create_policy(
-            &owner,
-            &String::from_str(&env, "Complete Lifecycle"),
-            &CoverageType::Health,
-            &150,
-            &75000,
-        );
-
-        env.mock_all_auths();
-
-        // Pay premium
-        client.pay_premium(&owner, &policy_id);
-
-        // Deactivate
-        client.deactivate_policy(&owner, &policy_id);
-
-        // Should have 6 events: 2 Created + 2 PremiumPaid + 2 Deactivated
-        let events = env.events().all();
-        assert_eq!(events.len(), 6);
-    }
-
-    // ====================================================================
-    // Storage TTL Extension Tests
-    //
-    // Verify that instance storage TTL is properly extended on
-    // state-changing operations, preventing unexpected data expiration.
-    //
-    // Contract TTL configuration:
-    //   INSTANCE_LIFETIME_THRESHOLD = 17,280 ledgers (~1 day)
-    //   INSTANCE_BUMP_AMOUNT        = 518,400 ledgers (~30 days)
-    //
-    // Operations extending instance TTL:
-    //   create_policy, pay_premium, batch_pay_premiums,
-    //   deactivate_policy, create_premium_schedule,
-    //   modify_premium_schedule, cancel_premium_schedule,
-    //   execute_due_premium_schedules
-    // ====================================================================
-
-    /// Verify that create_policy extends instance storage TTL.
-    #[test]
-    fn test_instance_ttl_extended_on_create_policy() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        env.ledger().set(LedgerInfo {
-            protocol_version: 20,
-            sequence_number: 100,
-            timestamp: 1000,
-            network_id: [0; 32],
-            base_reserve: 10,
-            min_temp_entry_ttl: 100,
-            min_persistent_entry_ttl: 100,
-            max_entry_ttl: 700_000,
-        });
-
-        let contract_id = env.register_contract(None, Insurance);
-        let client = InsuranceClient::new(&env, &contract_id);
-        let owner = Address::generate(&env);
-
-        let name = String::from_str(&env, "Health Insurance");
-        let coverage_type = String::from_str(&env, "health");
-        let policy_id = client.create_policy(&owner, &name, &coverage_type, &100, &10000, &None);
-
-        let result = client.deactivate_policy(&owner, &policy_id);
-        assert!(result);
-        // create_policy calls extend_instance_ttl
-        let policy_id = client.create_policy(
-            &owner,
-            &String::from_str(&env, "Health Insurance"),
-            &CoverageType::Health,
-            &100,
-            &50000,
-        );
-        assert_eq!(policy_id, 1);
-
-        // Inspect instance TTL — must be at least INSTANCE_BUMP_AMOUNT
-        let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
-        assert!(
-            ttl >= 518_400,
-            "Instance TTL ({}) must be >= INSTANCE_BUMP_AMOUNT (518,400) after create_policy",
-            ttl
-        );
-    }
-
-    /// Verify that pay_premium refreshes instance TTL after ledger advancement.
-    ///
-    /// extend_ttl(threshold, extend_to) only extends when TTL <= threshold.
-    /// We advance the ledger far enough for TTL to drop below 17,280.
-    #[test]
-    fn test_instance_ttl_refreshed_on_pay_premium() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        env.ledger().set(LedgerInfo {
-            protocol_version: 20,
-            sequence_number: 100,
-            timestamp: 1000,
-            network_id: [0; 32],
-            base_reserve: 10,
-            min_temp_entry_ttl: 100,
-            min_persistent_entry_ttl: 100,
-            max_entry_ttl: 700_000,
-        });
-
-        let contract_id = env.register_contract(None, Insurance);
-        let client = InsuranceClient::new(&env, &contract_id);
-        let owner = Address::generate(&env);
-
-        client.create_policy(
-            &owner,
-            &String::from_str(&env, "Life Insurance"),
-            &String::from_str(&env, "life"),
-            &200,
-            &100000,
-        );
-
-        // Advance ledger so TTL drops below threshold (17,280)
-        // After create_policy: live_until = 518,500. At seq 510,000: TTL = 8,500
-        env.ledger().set(LedgerInfo {
-            protocol_version: 20,
-            sequence_number: 510_000,
-            timestamp: 500_000,
-            network_id: [0; 32],
-            base_reserve: 10,
-            min_temp_entry_ttl: 100,
-            min_persistent_entry_ttl: 100,
-            max_entry_ttl: 700_000,
-        });
-
-        // pay_premium calls extend_instance_ttl → re-extends TTL to 518,400
-        client.pay_premium(&owner, &1);
-
-        let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
-        assert!(
-            ttl >= 518_400,
-            "Instance TTL ({}) must be >= 518,400 after pay_premium",
-            ttl
-        );
-    }
-
-    /// Verify data persists across repeated operations spanning multiple
-    /// ledger advancements, proving TTL is continuously renewed.
-    #[test]
-    fn test_set_external_ref_success() {
-        let env = create_test_env();
-        let contract_id = env.register_contract(None, Insurance);
-        let client = InsuranceClient::new(&env, &contract_id);
-        let owner = Address::generate(&env);
-
-        let name = String::from_str(&env, "Health Insurance");
-        let coverage_type = String::from_str(&env, "health");
-        let policy_id = client.create_policy(&owner, &name, &coverage_type, &100, &10000, &None);
-
-        let external_ref = Some(String::from_str(&env, "POLICY-EXT-99"));
-        assert!(client.set_external_ref(&owner, &policy_id, &external_ref));
-
-        let policy = client.get_policy(&policy_id).unwrap();
-        assert_eq!(policy.external_ref, external_ref);
-    }
-
-    #[test]
-    #[should_panic(expected = "Only the policy owner can update this policy reference")]
-    fn test_set_external_ref_unauthorized() {
-        let env = create_test_env();
-        let contract_id = env.register_contract(None, Insurance);
-        let client = InsuranceClient::new(&env, &contract_id);
-        let owner = Address::generate(&env);
-        let other = Address::generate(&env);
-
-        let name = String::from_str(&env, "Health Insurance");
-        let coverage_type = String::from_str(&env, "health");
-        let policy_id = client.create_policy(&owner, &name, &coverage_type, &100, &10000, &None);
-
-        client.set_external_ref(
-            &other,
-            &policy_id,
-            &Some(String::from_str(&env, "POLICY-EXT-99")),
-        );
-    }
-
-    #[test]
-    fn test_multiple_policies_management() {
-        let env = create_test_env();
-    fn test_policy_data_persists_across_ledger_advancements() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        env.ledger().set(LedgerInfo {
-            protocol_version: 20,
-            sequence_number: 100,
-            timestamp: 1000,
-            network_id: [0; 32],
-            base_reserve: 10,
-            min_temp_entry_ttl: 100,
-            min_persistent_entry_ttl: 100,
-            max_entry_ttl: 700_000,
-        });
-
-        let contract_id = env.register_contract(None, Insurance);
-        let client = InsuranceClient::new(&env, &contract_id);
-        let owner = Address::generate(&env);
-
-        // Phase 1: Create policy at seq 100. live_until = 518,500
-        let policy_id = client.create_policy(
-            &owner,
-            &String::from_str(&env, "Auto Insurance"),
-            &String::from_str(&env, "auto"),
-            &150,
-            &75000,
-        );
-
-        for (i, policy_name) in policy_names.iter().enumerate() {
-            let premium = ((i + 1) as i128) * 100;
-            let coverage = ((i + 1) as i128) * 10000;
-            let policy_id = client.create_policy(
-                &owner,
-                policy_name,
-                &coverage_type,
-                &premium,
-                &coverage,
-                &None,
-            );
-            policy_ids.push_back(policy_id);
-        }
-        // Phase 2: Advance to seq 510,000 (TTL = 8,500 < 17,280)
-        env.ledger().set(LedgerInfo {
-            protocol_version: 20,
-            sequence_number: 510_000,
-            timestamp: 510_000,
-            network_id: [0; 32],
-            base_reserve: 10,
-            min_temp_entry_ttl: 100,
-            min_persistent_entry_ttl: 100,
-            max_entry_ttl: 700_000,
-        });
-
-        client.pay_premium(&owner, &policy_id);
-
-        // Phase 3: Advance to seq 1,020,000 (TTL = 8,400 < 17,280)
-        env.ledger().set(LedgerInfo {
-            protocol_version: 20,
-            sequence_number: 1_020_000,
-            timestamp: 1_020_000,
-            network_id: [0; 32],
-            base_reserve: 10,
-            min_temp_entry_ttl: 100,
-            min_persistent_entry_ttl: 100,
-            max_entry_ttl: 700_000,
-        });
-
-        let policy_id2 = client.create_policy(
-            &owner,
-            &String::from_str(&env, "Travel Insurance"),
-            &String::from_str(&env, "travel"),
-            &50,
-            &20000,
-        );
-
-        // All policies should be accessible
-        let p1 = client.get_policy(&policy_id);
-        assert!(
-            p1.is_some(),
-            "First policy must persist across ledger advancements"
-        );
-        assert_eq!(p1.unwrap().monthly_premium, 150);
-
-        let p2 = client.get_policy(&policy_id2);
-        assert!(p2.is_some(), "Second policy must persist");
-
-        // TTL should be fully refreshed
-        let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
-        assert!(
-            ttl >= 518_400,
-            "Instance TTL ({}) must remain >= 518,400 after repeated operations",
-            ttl
-        );
-    }
-
-    /// Verify that deactivate_policy extends instance TTL.
-    #[test]
-    fn test_instance_ttl_extended_on_deactivate_policy() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        env.ledger().set(LedgerInfo {
-            protocol_version: 20,
-            sequence_number: 100,
-            timestamp: 1000,
-            network_id: [0; 32],
-            base_reserve: 10,
-            min_temp_entry_ttl: 100,
-            min_persistent_entry_ttl: 100,
-            max_entry_ttl: 700_000,
-        });
-
-        let contract_id = env.register_contract(None, Insurance);
-        let client = InsuranceClient::new(&env, &contract_id);
-        let owner = Address::generate(&env);
-
-        let policy_id = client.create_policy(
-            &owner,
-            &String::from_str(&env, "Dental"),
-            &String::from_str(&env, "dental"),
-            &75,
-            &25000,
-        );
-
-        // Advance ledger past threshold
-        env.ledger().set(LedgerInfo {
-            protocol_version: 20,
-            sequence_number: 510_000,
-            timestamp: 510_000,
-            network_id: [0; 32],
-            base_reserve: 10,
-            min_temp_entry_ttl: 100,
-            min_persistent_entry_ttl: 100,
-            max_entry_ttl: 700_000,
-        });
-
-        // deactivate_policy calls extend_instance_ttl
-        client.deactivate_policy(&owner, &policy_id);
-
-        let ttl = env.as_contract(&contract_id, || env.storage().instance().get_ttl());
-        assert!(
-            ttl >= 518_400,
-            "Instance TTL ({}) must be >= 518,400 after deactivate_policy",
-            ttl
-        );
-    }
-
-    // ──────────────────────────────────────────────────────────────────
-    // Test: pay_premium after deactivate_policy (#104)
-    // ──────────────────────────────────────────────────────────────────
-
-    /// After deactivating a policy, `pay_premium` must return an error.
-    /// The policy must remain inactive.
-    #[test]
-    fn test_pay_premium_after_deactivate() {
-        let env = Env::default();
-        env.mock_all_auths();
-
-        let contract_id = env.register_contract(None, Insurance);
-        let client = InsuranceClient::new(&env, &contract_id);
-        let owner = Address::generate(&env);
-
-        // 1. Create a policy
-        let policy_id = client.create_policy(
-            &owner,
-            &name,
-            &coverage_type,
-            &monthly_premium,
-            &coverage_amount,
-            &None,
-            &String::from_str(&env, "Health Plan"),
-            &CoverageType::Health,
-            &150,
-            &50000,
-        );
-
-        // Sanity: policy should be active after creation
-        let policy_before = client.get_policy(&policy_id).unwrap();
-        assert!(policy_before.active);
-
-        // 2. Deactivate the policy
-        let deactivated = client.deactivate_policy(&owner, &policy_id);
-        assert!(deactivated);
-
-        // Confirm it is now inactive
-        let policy_after_deactivate = client.get_policy(&policy_id).unwrap();
-        assert!(!policy_after_deactivate.active);
-
-        // 3. Attempt to pay premium — should return PolicyInactive error
-        let result = client.try_pay_premium(&owner, &policy_id);
-        assert_eq!(result, Err(Ok(InsuranceError::PolicyInactive)));
-    }
-
-    // -----------------------------------------------------------------------
-    // Property-based tests: time-dependent behavior
-    // -----------------------------------------------------------------------
-
-    proptest! {
-        /// After paying a premium at any timestamp `now`,
-        /// next_payment_date must always equal now + 30 days.
-        #[test]
-        fn prop_pay_premium_sets_next_payment_date(
-            now in 1_000_000u64..100_000_000u64,
-        ) {
-            let env = make_env();
-            env.ledger().set_timestamp(now);
-            env.mock_all_auths();
-            let cid = env.register_contract(None, Insurance);
-            let client = InsuranceClient::new(&env, &cid);
-            let owner = Address::generate(&env);
-
-            let policy_id = client.create_policy(
-                &owner,
-                &String::from_str(&env, "Policy"),
-                &String::from_str(&env, "health"),
-                &100,
-                &10000,
-            );
-
-            client.pay_premium(&owner, &policy_id);
-
-            let policy = client.get_policy(&policy_id).unwrap();
-            prop_assert_eq!(
-                policy.next_payment_date,
-                now + 30 * 86400,
-                "next_payment_date must equal now + 30 days after premium payment"
-            );
-        }
-    }
-
-    proptest! {
-        /// A premium schedule must not execute before its due date,
-        /// and must execute at or after its due date.
-        #[test]
-        fn prop_execute_due_schedules_only_triggers_past_due(
-            creation_time in 1_000_000u64..5_000_000u64,
-            gap in 1000u64..1_000_000u64,
-        ) {
-            let env = make_env();
-            env.ledger().set_timestamp(creation_time);
-            env.mock_all_auths();
-            let cid = env.register_contract(None, Insurance);
-            let client = InsuranceClient::new(&env, &cid);
-            let owner = Address::generate(&env);
-
-            let policy_id = client.create_policy(
-                &owner,
-                &String::from_str(&env, "Policy"),
-                &String::from_str(&env, "health"),
-                &100,
-                &10000,
-            );
-
-            // Schedule fires at creation_time + gap (strictly in the future)
-            let next_due = creation_time + gap;
-            let schedule_id = client.create_premium_schedule(&owner, &policy_id, &next_due, &0);
-
-            // One tick before due: schedule must not execute
-            env.ledger().set_timestamp(next_due - 1);
-            let executed_before = client.execute_due_premium_schedules();
-            prop_assert_eq!(
-                executed_before.len(),
-                0u32,
-                "schedule must not fire before its due date"
-            );
-
-            // Exactly at due date: schedule must execute
-            env.ledger().set_timestamp(next_due);
-            let executed_at = client.execute_due_premium_schedules();
-            prop_assert_eq!(executed_at.len(), 1u32);
-            prop_assert_eq!(executed_at.get(0).unwrap(), schedule_id);
-        }
-    }
-
-    // ══════════════════════════════════════════════════════════════════════
-    // Time & Ledger Drift Resilience Tests (#158)
-    //
-    // Assumptions:
-    //  - execute_due_premium_schedules fires when schedule.next_due <= current_time
-    //    (inclusive: executes exactly at next_due).
-    //  - next_payment_date = env.ledger().timestamp() + 30 * 86400 at execution,
-    //    anchored to actual payment time, not original next_due.
-    //  - Stellar ledger timestamps are monotonically increasing in production.
-    //    After execution next_due advances by the interval, guarding re-runs.
-    // ══════════════════════════════════════════════════════════════════════
-
-    fn set_time(env: &Env, timestamp: u64) {
-        let proto = env.ledger().protocol_version();
-        env.ledger().set(LedgerInfo {
-            protocol_version: proto,
-            sequence_number: 1,
-            timestamp,
-            network_id: [0; 32],
-            base_reserve: 10,
-            min_temp_entry_ttl: 1,
-            min_persistent_entry_ttl: 1,
-            max_entry_ttl: 100000,
-        });
-    }
-
-    /// Premium schedule must NOT execute one second before next_due.
-    #[test]
-    fn test_time_drift_premium_schedule_not_executed_before_next_due() {
-        let env = make_env();
-        env.mock_all_auths();
-        let id = env.register_contract(None, Insurance);
-        let client = InsuranceClient::new(&env, &id);
-        let owner = Address::generate(&env);
-
-        let next_due = 5000u64;
-        set_time(&env, 1000);
-
-        let policy_id = client.create_policy(
-            &owner,
-            &String::from_str(&env, "Life Cover"),
-            &String::from_str(&env, "life"),
-            &200,
-            &100000,
-        );
-        client.create_premium_schedule(&owner, &policy_id, &next_due, &2592000);
-
-        set_time(&env, next_due - 1);
-        let executed = client.execute_due_premium_schedules();
-        assert_eq!(
-            executed.len(),
-            0,
-            "Must not execute one second before next_due"
-        );
-    }
-
-    /// Premium schedule must execute exactly at next_due (inclusive boundary).
-    #[test]
-    fn test_time_drift_premium_schedule_executes_at_exact_next_due() {
-        let env = make_env();
-        env.mock_all_auths();
-        let id = env.register_contract(None, Insurance);
-        let client = InsuranceClient::new(&env, &id);
-        let owner = Address::generate(&env);
-
-        let next_due = 5000u64;
-        set_time(&env, 1000);
-
-        let policy_id = client.create_policy(
-            &owner,
-            &String::from_str(&env, "Health Plan"),
-            &String::from_str(&env, "health"),
-            &150,
-            &75000,
-        );
-        let schedule_id = client.create_premium_schedule(&owner, &policy_id, &next_due, &2592000);
-
-        set_time(&env, next_due);
-        let executed = client.execute_due_premium_schedules();
-        assert_eq!(executed.len(), 1, "Must execute exactly at next_due");
-        assert_eq!(executed.get(0).unwrap(), schedule_id);
-
-        let policy = client.get_policy(&policy_id).unwrap();
-        assert_eq!(
-            policy.next_payment_date,
-            next_due + 30 * 86400,
-            "next_payment_date must be current_time + 30 days"
-        );
-    }
-
-    /// next_payment_date is anchored to actual payment time, not original next_due.
-    #[test]
-    fn test_time_drift_next_payment_date_uses_actual_payment_time() {
-        let env = make_env();
-        env.mock_all_auths();
-        let id = env.register_contract(None, Insurance);
-        let client = InsuranceClient::new(&env, &id);
-        let owner = Address::generate(&env);
-
-        let next_due = 5000u64;
-        let late_payment = next_due + 7 * 86400; // paid 7 days late
-        set_time(&env, 1000);
-
-        let policy_id = client.create_policy(
-            &owner,
-            &String::from_str(&env, "Property Plan"),
-            &String::from_str(&env, "property"),
-            &300,
-            &200000,
-        );
-        client.create_premium_schedule(&owner, &policy_id, &next_due, &2592000);
-
-        set_time(&env, late_payment);
-        client.execute_due_premium_schedules();
-
-        let policy = client.get_policy(&policy_id).unwrap();
-        assert_eq!(
-            policy.next_payment_date,
-            late_payment + 30 * 86400,
-            "next_payment_date must be anchored to actual payment time"
-        );
-        assert!(
-            policy.next_payment_date > next_due + 30 * 86400,
-            "Late payment must push next_payment_date beyond on-time window"
-        );
-    }
-
-    /// After execution next_due advances; a call before the new next_due must not re-execute.
-    #[test]
-    fn test_time_drift_no_double_execution_after_schedule_advances() {
-        let env = make_env();
-        env.mock_all_auths();
-        let id = env.register_contract(None, Insurance);
-        let client = InsuranceClient::new(&env, &id);
-        let owner = Address::generate(&env);
-
-        let next_due = 5000u64;
-        let interval = 2_592_000u64;
-        set_time(&env, 1000);
-
-        let policy_id = client.create_policy(
-            &owner,
-            &String::from_str(&env, "Auto Cover"),
-            &String::from_str(&env, "auto"),
-            &100,
-            &50000,
-        );
-        client.create_premium_schedule(&owner, &policy_id, &next_due, &interval);
-
-        // First execution at next_due
-        set_time(&env, next_due);
-        let executed = client.execute_due_premium_schedules();
-        assert_eq!(executed.len(), 1);
-
-        // Between old next_due and new next_due: no re-execution
-        set_time(&env, next_due + 1000);
-        let executed_again = client.execute_due_premium_schedules();
-        assert_eq!(
-            executed_again.len(),
-            0,
-            "Must not re-execute before the new next_due"
-        );
-    }
-
-    // -----------------------------------------------------------------------
-    // Property-based tests: time-dependent behavior
-    // -----------------------------------------------------------------------
-
-    proptest! {
-        /// After paying a premium at any timestamp `now`,
-        /// next_payment_date must always equal now + 30 days.
-        #[test]
-        fn prop_pay_premium_sets_next_payment_date(
-            now in 1_000_000u64..100_000_000u64,
-        ) {
-            let env = make_env();
-            env.ledger().set_timestamp(now);
-            env.mock_all_auths();
-            let cid = env.register_contract(None, Insurance);
-            let client = InsuranceClient::new(&env, &cid);
-            let owner = Address::generate(&env);
-
-            let policy_id = client.create_policy(
-                &owner,
-                &String::from_str(&env, "Policy"),
-                &String::from_str(&env, "health"),
-                &100,
-                &10000,
-            );
-
-            client.pay_premium(&owner, &policy_id);
-
-            let policy = client.get_policy(&policy_id).unwrap();
-            prop_assert_eq!(
-                policy.next_payment_date,
-                now + 30 * 86400,
-                "next_payment_date must equal now + 30 days after premium payment"
-            );
-        }
-    }
-
-    proptest! {
-        /// A premium schedule must not execute before its due date,
-        /// and must execute at or after its due date.
-        #[test]
-        fn prop_execute_due_schedules_only_triggers_past_due(
-            creation_time in 1_000_000u64..5_000_000u64,
-            gap in 1000u64..1_000_000u64,
-        ) {
-            let env = make_env();
-            env.ledger().set_timestamp(creation_time);
-            env.mock_all_auths();
-            let cid = env.register_contract(None, Insurance);
-            let client = InsuranceClient::new(&env, &cid);
-            let owner = Address::generate(&env);
-
-            let policy_id = client.create_policy(
-                &owner,
-                &String::from_str(&env, "Policy"),
-                &String::from_str(&env, "health"),
-                &100,
-                &10000,
-            );
-
-            // Schedule fires at creation_time + gap (strictly in the future)
-            let next_due = creation_time + gap;
-            let schedule_id = client.create_premium_schedule(&owner, &policy_id, &next_due, &0);
-
-            // One tick before due: schedule must not execute
-            env.ledger().set_timestamp(next_due - 1);
-            let executed_before = client.execute_due_premium_schedules();
-            prop_assert_eq!(
-                executed_before.len(),
-                0u32,
-                "schedule must not fire before its due date"
-            );
-
-            // Exactly at due date: schedule must execute
-            env.ledger().set_timestamp(next_due);
-            let executed_at = client.execute_due_premium_schedules();
-            prop_assert_eq!(executed_at.len(), 1u32);
-            prop_assert_eq!(executed_at.get(0).unwrap(), schedule_id);
-        }
-    }
-}
