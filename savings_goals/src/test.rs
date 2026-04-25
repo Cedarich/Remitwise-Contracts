@@ -4263,3 +4263,179 @@ mod migration_e2e_tests {
         }
     }
 }
+
+// ============================================================================
+// Invariant tests: lock/unlock and unlock_date boundaries
+//
+// Confirmed contract behavior (from lib.rs):
+//   - withdraw_from_goal() returns Err(SavingsGoalsError::GoalLocked) when:
+//       (a) goal.locked == true, OR
+//       (b) goal.unlock_date == Some(d) && current_time < d
+//   - Boundary: current_time == unlock_date is ALLOWED (>= semantics)
+//   - create_goal() sets locked: true by default
+//   - unlock_date type: Option<u64> — None means no time-lock
+//   - No batch withdrawal exists in this contract
+// ============================================================================
+
+/// INVARIANT: locked:true blocks withdrawal regardless of unlock_date.
+#[test]
+fn test_lock_blocks_withdrawal() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+
+    set_ledger_time(&env, 1, 1000);
+    // create_goal sets locked:true by default
+    let goal_id = client.create_goal(&owner, &String::from_str(&env, "Inv"), &1000, &9999);
+    client.add_to_goal(&owner, &goal_id, &500);
+
+    // Goal is locked — withdrawal must fail with GoalLocked
+    let result = client.try_withdraw_from_goal(&owner, &goal_id, &100);
+    assert_eq!(
+        result,
+        Err(Ok(SavingsGoalsError::GoalLocked)),
+        "locked:true must block withdrawal"
+    );
+}
+
+/// INVARIANT: advancing ledger time past unlock_date allows withdrawal.
+/// (Distinct framing from test_withdraw_time_locked_goal_after_unlock:
+///  that test uses a fixed future timestamp; this one explicitly advances
+///  from before to after and re-asserts the state transition.)
+#[test]
+fn test_time_advance_unlocks_withdrawal() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+
+    set_ledger_time(&env, 1, 1000);
+    let goal_id = client.create_goal(&owner, &String::from_str(&env, "Inv"), &1000, &9999);
+    client.add_to_goal(&owner, &goal_id, &500);
+    client.unlock_goal(&owner, &goal_id);
+    client.set_time_lock(&owner, &goal_id, &5000);
+
+    // Before unlock_date — must be blocked
+    set_ledger_time(&env, 2, 4999);
+    assert!(
+        client.try_withdraw_from_goal(&owner, &goal_id, &100).is_err(),
+        "must be blocked before unlock_date"
+    );
+
+    // After unlock_date — must succeed
+    set_ledger_time(&env, 3, 5001);
+    let remaining = client.withdraw_from_goal(&owner, &goal_id, &100);
+    assert_eq!(remaining, 400);
+}
+
+/// INVARIANT: withdrawal at exactly unlock_date is allowed (>= boundary).
+#[test]
+fn test_boundary_at_exact_unlock_date() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+
+    set_ledger_time(&env, 1, 1000);
+    let goal_id = client.create_goal(&owner, &String::from_str(&env, "Inv"), &1000, &9999);
+    client.add_to_goal(&owner, &goal_id, &500);
+    client.unlock_goal(&owner, &goal_id);
+    client.set_time_lock(&owner, &goal_id, &5000);
+
+    // Exactly at unlock_date — must succeed
+    set_ledger_time(&env, 2, 5000);
+    let remaining = client.withdraw_from_goal(&owner, &goal_id, &100);
+    assert_eq!(remaining, 400, "withdrawal at exact unlock_date must succeed");
+}
+
+/// INVARIANT: withdrawal one second before unlock_date is blocked.
+#[test]
+fn test_boundary_one_second_before_unlock_date() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+
+    set_ledger_time(&env, 1, 1000);
+    let goal_id = client.create_goal(&owner, &String::from_str(&env, "Inv"), &1000, &9999);
+    client.add_to_goal(&owner, &goal_id, &500);
+    client.unlock_goal(&owner, &goal_id);
+    client.set_time_lock(&owner, &goal_id, &5000);
+
+    // One second before unlock_date — must be blocked
+    set_ledger_time(&env, 2, 4999);
+    let result = client.try_withdraw_from_goal(&owner, &goal_id, &100);
+    assert_eq!(
+        result,
+        Err(Ok(SavingsGoalsError::GoalLocked)),
+        "withdrawal one second before unlock_date must be blocked"
+    );
+}
+
+/// INVARIANT: export_snapshot/import_snapshot preserves lock semantics.
+/// A locked goal exported and re-imported must still block withdrawal.
+#[test]
+fn test_snapshot_preserves_lock_semantics() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+
+    set_ledger_time(&env, 1, 1000);
+    client.init();
+    let goal_id = client.create_goal(&owner, &String::from_str(&env, "Inv"), &1000, &9999);
+    client.add_to_goal(&owner, &goal_id, &500);
+    // Goal is locked:true by default — do NOT unlock
+
+    // Export and re-import the snapshot
+    let snapshot = client.export_snapshot(&owner);
+    assert!(
+        snapshot.goals.get(0).map(|g| g.locked).unwrap_or(false),
+        "exported goal must be locked"
+    );
+    client.import_snapshot(&owner, &0, &snapshot);
+
+    // After import, withdrawal must still be blocked
+    let result = client.try_withdraw_from_goal(&owner, &goal_id, &100);
+    assert_eq!(
+        result,
+        Err(Ok(SavingsGoalsError::GoalLocked)),
+        "lock must be preserved after snapshot import"
+    );
+}
+
+/// INVARIANT: goal with unlock_date:None (no time-lock) allows withdrawal
+/// once the manual lock is removed.
+#[test]
+fn test_unlock_date_none_allows_withdrawal() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, SavingsGoalContract);
+    let client = SavingsGoalContractClient::new(&env, &contract_id);
+    let owner = Address::generate(&env);
+
+    set_ledger_time(&env, 1, 1000);
+    let goal_id = client.create_goal(&owner, &String::from_str(&env, "Inv"), &1000, &9999);
+    client.add_to_goal(&owner, &goal_id, &500);
+
+    // Confirm unlock_date is None
+    let goal = client.get_goal(&goal_id).unwrap();
+    assert_eq!(goal.unlock_date, None, "unlock_date must be None");
+
+    // Unlock the manual lock — no time-lock set, so withdrawal must succeed
+    client.unlock_goal(&owner, &goal_id);
+    let remaining = client.withdraw_from_goal(&owner, &goal_id, &100);
+    assert_eq!(remaining, 400, "withdrawal must succeed when unlock_date is None");
+}
+
+// INVARIANT: batch operations enforce lock.
+// No batch withdrawal function exists in this contract.
+// batch_add_to_goals() only adds funds and does not check the lock flag,
+// which is correct — deposits are always allowed regardless of lock state.
+// #[test] fn test_batch_operations_enforce_lock — no batch withdrawal in this contract
