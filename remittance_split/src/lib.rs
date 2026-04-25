@@ -75,6 +75,7 @@ pub enum RemittanceSplitError {
     ScheduleIntervalTooShort = 23,
     /// The schedule lead time exceeds the maximum allowed value.
     ScheduleLeadTimeTooLong = 24,
+    InvalidDeadline = 25,
 }
 
 #[derive(Clone)]
@@ -263,19 +264,14 @@ pub struct SchedulePage {
     pub count: u32,
 }
 
-/// Paginated result for `get_audit_log` queries.
-///
-/// Pagination contract is identical to `SchedulePage`: items are ordered
-/// oldest-to-newest, `next_cursor == 0` signals no more pages, and the
-/// result is deterministic for a given `(from_index, limit)` on identical
-/// state.
+/// Paginated result for remittance schedules with optional cursor.
 #[contracttype]
 #[derive(Clone)]
-pub struct AuditPage {
-    /// Audit entries for this page, ordered oldest-to-newest.
-    pub items: Vec<AuditEntry>,
-    /// Index to pass as `from_index` for the next page. 0 means no more pages.
-    pub next_cursor: u32,
+pub struct RemittanceSchedulePage {
+    /// Schedule entries for this page, ordered by ID ascending.
+    pub items: Vec<RemittanceSchedule>,
+    /// Cursor to pass as `cursor` for the next page. None means no more pages.
+    pub next_cursor: Option<u32>,
     /// Number of items returned in this page.
     pub count: u32,
 }
@@ -1106,7 +1102,13 @@ impl RemittanceSplit {
         }
 
         // Verify request hash matches computed hash
-        let computed_hash = Self::compute_request_hash(&env, &request);
+        let computed_hash = Self::compute_request_hash(
+            symbol_short!("distH"),
+            request.from.clone(),
+            request.nonce,
+            request.total_amount,
+            request.deadline,
+        );
         if computed_hash.ne(&request_hash) {
             Self::append_audit(&env, symbol_short!("distH"), &request.from, false);
             return Err(RemittanceSplitError::RequestHashMismatch);
@@ -2211,6 +2213,8 @@ impl RemittanceSplit {
             .unwrap_or_else(|| Vec::new(&env));
 
         schedule_ids.sort_unstable();
+
+        sort_u32_vec_ascending(&mut schedule_ids);
 
         let len = schedule_ids.len();
         let cap = clamp_limit(limit);
