@@ -9,10 +9,15 @@ use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token::TokenClient, vec,
     Address, BytesN, Env, IntoVal, Map, Symbol, Vec,
 };
+use soroban_sdk::crypto::Sha256;
 
 // Event topics
 const SPLIT_INITIALIZED: Symbol = symbol_short!("init");
 const SPLIT_CALCULATED: Symbol = symbol_short!("calc");
+
+// Request hash domain separator for signing (prevents cross-domain attacks)
+const DISTRIBUTE_USDC_DOMAIN: &[u8] = b"distribute_usdc_v1";
+const MAX_DEADLINE_WINDOW_SECS: u64 = 3600; // 1 hour deadline window
 
 // Event data structures
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -73,6 +78,26 @@ pub struct AccountGroup {
     pub savings: Address,
     pub bills: Address,
     pub insurance: Address,
+}
+
+/// Typed request for distribute_usdc signing.
+/// This structure contains all parameters needed for distributing USDC.
+/// Signers use this to compute a deterministic request hash.
+#[derive(Clone)]
+#[contracttype]
+pub struct DistributeUsdcRequest {
+    /// USDC contract address
+    pub usdc_contract: Address,
+    /// Sender/payer address
+    pub from: Address,
+    /// Nonce for replay protection
+    pub nonce: u64,
+    /// Destination accounts for split allocation
+    pub accounts: AccountGroup,
+    /// Total USDC amount to distribute
+    pub total_amount: i128,
+    /// Deadline timestamp (Unix seconds) - request is invalid after this time
+    pub deadline: u64,
 }
 
 // Storage TTL constants
@@ -931,6 +956,117 @@ impl RemittanceSplit {
             dist_event,
         );
 
+        Ok(true)
+    }
+
+    /// Distribute USDC with request hash and deadline verification.
+    ///
+    /// This function provides secure USDC distribution with deterministic request hashing
+    /// and deadline enforcement. Integrators sign the request hash before calling this function.
+    ///
+    /// # Arguments
+    /// * `env` - Soroban environment
+    /// * `request` - DistributeUsdcRequest containing all parameters and deadline
+    /// * `request_hash` - Pre-computed SHA-256 hash that must match compute_request_hash(request)
+    ///
+    /// # Returns
+    /// True if distribution was successful, Error if verification or execution fails
+    ///
+    /// # Errors
+    /// - `InvalidAmount` - total_amount <= 0
+    /// - `DeadlineExpired` - current_time > request.deadline
+    /// - `InvalidDeadline` - deadline is 0 or unreasonably far in future
+    /// - `InvalidNonce` - nonce doesn't match expected value
+    /// - `RequestHashMismatch` - provided hash doesn't match computed hash
+    /// - `Overflow` - arithmetic overflow in split calculation
+    ///
+    /// # Security Properties
+    /// 1. **Deadline Enforcement**: Prevents indefinite validity of signed requests (max 1 hour window)
+    /// 2. **Hash Verification**: Ensures no parameter tampering (all params bound to hash)
+    /// 3. **Nonce Protection**: Prevents replay attacks
+    /// 4. **Domain Separation**: Hash includes "distribute_usdc_v1" separator
+    /// 5. **Deterministic**: Same inputs always produce same hash
+    ///
+    /// # Example Workflow
+    /// 1. Off-chain: Create DistributeUsdcRequest with deadline = now() + 600 seconds
+    /// 2. Off-chain: Call get_request_hash to obtain hash
+    /// 3. Off-chain: Sign the hash with payer's private key
+    /// 4. On-chain: Call distribute_usdc_with_hash_and_deadline with request and signature
+    ///
+    /// # Parameter Binding Fields
+    /// All parameters are cryptographically bound via SHA-256:
+    /// - `usdc_contract`: USDC token contract address (prevents cross-token attacks)
+    /// - `from`: Payer address (prevents impersonation)
+    /// - `nonce`: Transaction sequence number (prevents replays)
+    /// - `accounts.spending`: Spending destination (prevents fund misdirection)
+    /// - `accounts.savings`: Savings destination (prevents fund misdirection)
+    /// - `accounts.bills`: Bills destination (prevents fund misdirection)
+    /// - `accounts.insurance`: Insurance destination (prevents fund misdirection)
+    /// - `total_amount`: Total amount to distribute (prevents amount tampering)
+    /// - `deadline`: Expiry time (prevents stale request use)
+    pub fn distribute_usdc_with_hash_and_deadline(
+        env: Env,
+        request: DistributeUsdcRequest,
+        request_hash: Bytes,
+    ) -> Result<bool, RemittanceSplitError> {
+        // Validate amount
+        if request.total_amount <= 0 {
+            Self::append_audit(&env, symbol_short!("distH"), &request.from, false);
+            return Err(RemittanceSplitError::InvalidAmount);
+        }
+
+        // Validate deadline
+        let current_time = env.ledger().timestamp();
+        if request.deadline == 0 {
+            Self::append_audit(&env, symbol_short!("distH"), &request.from, false);
+            return Err(RemittanceSplitError::InvalidDeadline);
+        }
+        if current_time > request.deadline {
+            Self::append_audit(&env, symbol_short!("distH"), &request.from, false);
+            return Err(RemittanceSplitError::DeadlineExpired);
+        }
+        
+        // Validate deadline is within reasonable bounds (max 1 hour from now)
+        let deadline_in_future = request.deadline - current_time;
+        if deadline_in_future > MAX_DEADLINE_WINDOW_SECS {
+            Self::append_audit(&env, symbol_short!("distH"), &request.from, false);
+            return Err(RemittanceSplitError::InvalidDeadline);
+        }
+
+        // Verify request hash matches computed hash
+        let computed_hash = Self::compute_request_hash(&env, &request);
+        if computed_hash.ne(&request_hash) {
+            Self::append_audit(&env, symbol_short!("distH"), &request.from, false);
+            return Err(RemittanceSplitError::RequestHashMismatch);
+        }
+
+        // Require authorization from payer
+        request.from.require_auth();
+
+        // Verify nonce
+        Self::require_nonce(&env, &request.from, request.nonce)?;
+
+        // Calculate split amounts
+        let amounts = Self::calculate_split_amounts(&env, request.total_amount, false)?;
+        let token = TokenClient::new(&env, &request.usdc_contract);
+
+        // Execute transfers
+        if amounts[0] > 0 {
+            token.transfer(&request.from, &request.accounts.spending, &amounts[0]);
+        }
+        if amounts[1] > 0 {
+            token.transfer(&request.from, &request.accounts.savings, &amounts[1]);
+        }
+        if amounts[2] > 0 {
+            token.transfer(&request.from, &request.accounts.bills, &amounts[2]);
+        }
+        if amounts[3] > 0 {
+            token.transfer(&request.from, &request.accounts.insurance, &amounts[3]);
+        }
+
+        // Increment nonce and record success
+        Self::increment_nonce(&env, &request.from)?;
+        Self::append_audit(&env, symbol_short!("distH"), &request.from, true);
         Ok(true)
     }
 
