@@ -935,6 +935,37 @@ fn test_add_member_unauthorized() {
 }
 
 #[test]
+fn test_add_member_already_exists() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let contract_id = env.register_contract(None, FamilyWallet);
+    let client = FamilyWalletClient::new(&env, &contract_id);
+
+    let owner = Address::generate(&env);
+    let member1 = Address::generate(&env);
+    let initial_members = vec![&env, member1.clone()];
+
+    client.init(&owner, &initial_members);
+
+    // Try to add member1 again (they already exist from initialization)
+    let result = client.try_add_family_member(&owner, &member1, &FamilyRole::Admin);
+    assert_eq!(result, Err(Ok(Error::MemberAlreadyExists)));
+
+    // Try to add owner (they already exist and are the owner)
+    let result = client.try_add_family_member(&owner, &owner, &FamilyRole::Admin);
+    assert_eq!(result, Err(Ok(Error::MemberAlreadyExists)));
+
+    // Add a new member successfully
+    let new_member = Address::generate(&env);
+    let result = client.try_add_family_member(&owner, &new_member, &FamilyRole::Member);
+    assert!(result.is_ok());
+
+    // Try to add the same new member again
+    let result = client.try_add_family_member(&owner, &new_member, &FamilyRole::Admin);
+    assert_eq!(result, Err(Ok(Error::MemberAlreadyExists)));
+}
+
+#[test]
 fn test_different_thresholds_for_different_transaction_types() {
     let env = Env::default();
     env.mock_all_auths();

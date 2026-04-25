@@ -267,6 +267,7 @@ pub enum Error {
     DuplicateSigner = 18,
     TooManySigners = 19,
     InvalidPrecisionConfig = 20,
+    MemberAlreadyExists = 21,
 }
 
 #[contractimpl]
@@ -387,7 +388,7 @@ impl FamilyWallet {
             .unwrap_or_else(|| panic!("Wallet not initialized"));
 
         if members.get(member_address.clone()).is_some() {
-            return Err(Error::InvalidRole);
+            return Err(Error::MemberAlreadyExists);
         }
 
         Self::extend_instance_ttl(&env);
