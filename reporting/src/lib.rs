@@ -779,7 +779,7 @@ impl ReportingContract {
             });
         }
 
-        RemittanceSummary {
+        Ok(RemittanceSummary {
             total_received: total_amount,
             total_allocated: total_amount,
             category_breakdown: breakdown,
@@ -818,7 +818,7 @@ impl ReportingContract {
             .storage()
             .instance()
             .get(&symbol_short!("ADDRS"))
-            .unwrap_or_else(|| panic!("Contract addresses not configured"));
+            .ok_or(ReportingError::AddressesNotConfigured)?;
 
         let savings_client = SavingsGoalsClient::new(env, &addresses.savings_goals);
         let goals = savings_client.get_all_goals(&user);
@@ -839,7 +839,7 @@ impl ReportingContract {
         let completion_percentage = safe_percent(total_saved, total_target, 100)
             .min(100) as u32;
 
-        SavingsReport {
+        Ok(SavingsReport {
             total_goals,
             completed_goals: completed_count,
             total_target,
@@ -847,7 +847,7 @@ impl ReportingContract {
             completion_percentage,
             period_start,
             period_end,
-        }
+        })
     }
 
     /// Generate bill payment compliance report.
@@ -879,7 +879,7 @@ impl ReportingContract {
             .storage()
             .instance()
             .get(&symbol_short!("ADDRS"))
-            .unwrap_or_else(|| panic!("Contract addresses not configured"));
+            .ok_or(ReportingError::AddressesNotConfigured)?;
 
         let bill_client = BillPaymentsClient::new(env, &addresses.bill_payments);
 
@@ -932,7 +932,7 @@ impl ReportingContract {
                 .min(100) as u32
         };
 
-        BillComplianceReport {
+        Ok(BillComplianceReport {
             total_bills,
             paid_bills,
             unpaid_bills,
@@ -976,7 +976,7 @@ impl ReportingContract {
             .storage()
             .instance()
             .get(&symbol_short!("ADDRS"))
-            .unwrap_or_else(|| panic!("Contract addresses not configured"));
+            .ok_or(ReportingError::AddressesNotConfigured)?;
 
         let insurance_client = InsuranceClient::new(env, &addresses.insurance);
         let monthly_premium = insurance_client.get_total_monthly_premium(&user);
@@ -1008,7 +1008,7 @@ impl ReportingContract {
         let coverage_to_premium_ratio = safe_percent(total_coverage, annual_premium, 100)
             .clamp(0, u32::MAX as i128) as u32;
 
-        InsuranceReport {
+        Ok(InsuranceReport {
             active_policies,
             total_coverage,
             monthly_premium,
@@ -1035,7 +1035,7 @@ impl ReportingContract {
             .storage()
             .instance()
             .get(&symbol_short!("ADDRS"))
-            .unwrap_or_else(|| panic!("Contract addresses not configured"));
+            .ok_or(ReportingError::AddressesNotConfigured)?;
 
         // Savings score (0-40 points)
         let savings_client = SavingsGoalsClient::new(env, &addresses.savings_goals);
@@ -1080,12 +1080,12 @@ impl ReportingContract {
             .saturating_add(insurance_score)
             .min(100);
 
-        HealthScore {
+        Ok(HealthScore {
             score: total_score,
             savings_score,
             bills_score,
             insurance_score,
-        }
+        })
     }
 
     /// Generate comprehensive financial health report combining all metrics.
