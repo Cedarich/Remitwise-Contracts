@@ -1,6 +1,8 @@
 #![no_std]
+#![no_std]
 #![allow(clippy::too_many_arguments)]
 #![cfg_attr(not(test), deny(clippy::unwrap_used, clippy::expect_used))]
+extern crate alloc;
 #[cfg(test)]
 mod events_schema_test;
 #[cfg(test)]
@@ -111,8 +113,6 @@ const INSTANCE_LIFETIME_THRESHOLD: u32 = 17280; // ~1 day
 const INSTANCE_BUMP_AMOUNT: u32 = 518400; // ~30 days
 /// Maximum number of used nonces tracked per address before the oldest are pruned.
 const MAX_USED_NONCES_PER_ADDR: u32 = 256;
-/// Maximum ledger seconds a signed request may remain valid after creation.
-const MAX_DEADLINE_WINDOW_SECS: u64 = 3600; // 1 hour
 /// Maximum number of remittance schedules allowed per owner to prevent storage bloat.
 pub const MAX_SCHEDULES_PER_OWNER: u32 = 50;
 /// Minimum allowed recurrence interval for repeating schedules (1 hour in seconds).
@@ -236,19 +236,8 @@ pub struct AuditEntry {
     pub success: bool,
 }
 
-/// Paginated result for audit log queries.
-#[contracttype]
-#[derive(Clone)]
-pub struct AuditPage {
-    /// Audit entries for this page, ordered by index ascending.
-    pub items: Vec<AuditEntry>,
-    /// Index to pass as `from_index` for the next page. 0 means no more pages.
-    pub next_cursor: u32,
-    /// Number of items returned in this page.
-    pub count: u32,
-}
 
-/// Paginated result for schedule queries.
+
 ///
 /// Provides stable cursor-based pagination so consumers can replay the schedule list
 /// without gaps or duplicates across page boundaries. Schedules are ordered by ID ascending.
@@ -1057,7 +1046,7 @@ impl RemittanceSplit {
     /// 1. Off-chain: Create DistributeUsdcRequest with deadline = now() + 600 seconds
     /// 2. Off-chain: Call get_request_hash to obtain hash
     /// 3. Off-chain: Sign the hash with payer's private key
-    /// 4. On-chain: Call distribute_usdc_with_hash_and_deadline with request and signature
+    /// 4. On-chain: Call distribute_usdc_signed with request and signature
     ///
     /// # Parameter Binding Fields
     /// All parameters are cryptographically bound via SHA-256:
@@ -2183,7 +2172,7 @@ impl RemittanceSplit {
     /// * `limit`  - Maximum items to return; clamped to `[1, MAX_PAGE_LIMIT]`
     ///
     /// # Returns
-    /// `RemittanceSchedulePage` with:
+    /// `SchedulePage` with:
     /// - `items`: schedules for this page, ordered by ID ascending
     /// - `next_cursor`: `Some(next_index)` when more pages exist, `None` when exhausted
     /// - `count`: number of items in this page

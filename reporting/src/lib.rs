@@ -777,18 +777,17 @@ impl ReportingContract {
         let addresses: Option<ContractAddresses> =
             env.storage().instance().get(&symbol_short!("ADDRS"));
 
-        if addresses.is_none() {
-            return RemittanceSummary {
+        let addresses = match addresses {
+            Some(a) => a,
+            None => return RemittanceSummary {
                 total_received: total_amount,
                 total_allocated: total_amount,
                 category_breakdown: Vec::new(env),
                 period_start,
                 period_end,
                 data_availability: DataAvailability::Missing,
-            };
-        }
-
-        let addresses = addresses.unwrap();
+            },
+        };
         let split_client = RemittanceSplitClient::new(env, &addresses.remittance_split);
         let mut availability = DataAvailability::Complete;
 
